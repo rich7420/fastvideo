@@ -12,6 +12,7 @@ import subprocess
 import torch
 import json
 from huggingface_hub import snapshot_download
+from torch.profiler import ProfilerActivity, profile, record_function
 from fastvideo.utils import logger
 # Import the training pipeline
 from fastvideo.training.wan_training_pipeline import main
@@ -29,7 +30,7 @@ WANDB_SUMMARY_FILE = OUTPUT_DIR / "tracker/wandb/latest-run/files/wandb-summary.
 NUM_NODES = "1"
 NUM_GPUS_PER_NODE = "2"
 GRAD_ACCUM = "1"
-MASTER_PORT = "29504"
+MASTER_PORT = "29604"
 
 os.environ["MASTER_ADDR"] = "localhost"
 os.environ["MASTER_PORT"] = MASTER_PORT
@@ -89,10 +90,85 @@ def run_worker():
     pipeline = WanTrainingPipeline.from_pretrained(
         args.pretrained_model_name_or_path, args=args)
     args = pipeline.training_args
-    pipeline.train()
+
+    # Profile the training run with torch.profiler to estimate FLOPs.
+    with profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        record_shapes=True,
+        with_flops=True,
+    ) as prof:
+        with record_function("training_step_profiler_run"):
+            pipeline.train()
+
     logger.info("Training pipeline done")
 
-def test_distributed_training():
+    # Print FLOPs table
+    try:
+        table = prof.key_averages().table(sort_by="flops", row_limit=20)
+        logger.info("Torch profiler FLOPs summary:\n%s", table)
+    except Exception as exc:  # Defensive: profiler APIs can differ by torch version
+        logger.warning("Failed to summarize torch.profiler results: %s", exc)
+
+    # Numeric FLOPs extraction: sum across all SP ranks via all_reduce
+    import torch.distributed as dist
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    max_train_steps = args.max_train_steps
+    world_size = int(NUM_GPUS_PER_NODE)
+    try:
+        rank_flops = sum(
+            getattr(e, "flops", 0) or 0 for e in prof.key_averages()
+        )
+    except Exception:
+        rank_flops = 0.0
+    flops_t = torch.tensor(rank_flops, dtype=torch.float64)
+    try:
+        if dist.is_initialized():
+            dist.all_reduce(flops_t, op=dist.ReduceOp.SUM)
+    except Exception as exc:
+        logger.warning("dist.all_reduce failed: %s", exc)
+    total_profiler_flops = flops_t.item()
+    profiler_flops_per_step = total_profiler_flops / max_train_steps
+    logger.info(
+        "Profiler FLOPs: total=%.4e  per_step=%.4e",
+        total_profiler_flops, profiler_flops_per_step,
+    )
+
+    # Compare with formula FLOPs (rank 0 only, reads wandb summary)
+    if local_rank == 0 and WANDB_SUMMARY_FILE.exists():
+        try:
+            with WANDB_SUMMARY_FILE.open() as _f:
+                _s = json.load(_f)
+            _batch = _s.get("batch_size", 1)
+            _seq   = _s.get("dit_seq_len", 0)
+            _ctx   = _s.get("context_len", 512)
+            _h     = _s.get("hidden_dim", 1536)
+            _nl    = _s.get("num_layers", 30)
+            _ffn   = _s.get("ffn_dim", 8960)
+            _grad  = args.gradient_accumulation_steps
+            _fpl = (
+                8 * _h * _h * _seq
+                + 4 * _h * _h * _seq + 4 * _h * _h * _ctx
+                + 4 * _h * _ffn * _seq
+                + 4 * _seq * _seq * _h
+                + 4 * _seq * _ctx * _h
+            )
+            formula_flops_per_step = _batch * _fpl * _nl * 4 * _grad
+            ratio = (
+                profiler_flops_per_step / formula_flops_per_step
+                if formula_flops_per_step else 0.0
+            )
+            logger.info(
+                "\n=== Profiler vs Formula Sanity Check ===\n"
+                "  formula  FLOPs/step: %.4e\n"
+                "  profiler FLOPs/step: %.4e\n"
+                "  ratio (profiler/formula): %.4f\n"
+                "  (ratio < 1 expected: FlashAttn custom kernels excluded from profiler)",
+                formula_flops_per_step, profiler_flops_per_step, ratio,
+            )
+        except Exception as exc:
+            logger.warning("Profiler vs formula comparison failed: %s", exc)
+
+def test_distributed_training(profile=False):
     """Test the distributed training setup"""
     os.environ["WANDB_MODE"] = "online"
 

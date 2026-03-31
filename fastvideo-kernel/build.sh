@@ -11,7 +11,7 @@ set -ex
 echo "Building fastvideo-kernel..."
 
 # Ensure submodules are initialized if needed (tk)
-git submodule update --init --recursive
+git submodule update --init --recursive || true
 
 # Install build dependencies
 uv pip install scikit-build-core cmake ninja
