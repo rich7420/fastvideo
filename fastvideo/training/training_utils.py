@@ -98,11 +98,20 @@ def get_sigmas(noise_scheduler, device, timesteps, n_dim=4, dtype=torch.float32)
     sigmas = noise_scheduler.sigmas.to(device=device, dtype=dtype)
     schedule_timesteps = noise_scheduler.timesteps.to(device)
     timesteps = timesteps.to(device)
-    step_indices = [(schedule_timesteps == t).nonzero().item() for t in timesteps]
-
+    # Vectorized match: [B] x [S] == (broadcast) -> [B, S]; argmax picks first match
+    # per row (same as sequential .nonzero().item() when each t appears once).
+    match = schedule_timesteps.unsqueeze(0) == timesteps.unsqueeze(1)
+    if not bool(match.any(dim=1).all().item()):
+        missing = timesteps[~match.any(dim=1)]
+        raise RuntimeError(
+            "get_sigmas: timestep(s) not found in scheduler schedule: "
+            f"{missing.detach().cpu().tolist()[:16]}")
+    step_indices = match.float().argmax(dim=1).to(
+        device=sigmas.device, dtype=torch.long)
     sigma = sigmas[step_indices].flatten()
-    while len(sigma.shape) < n_dim:
-        sigma = sigma.unsqueeze(-1)
+    nd = n_dim - sigma.ndim
+    if nd > 0:
+        sigma = sigma.reshape(*sigma.shape, *([1] * nd))
     return sigma
 
 
@@ -795,16 +804,32 @@ def load_distillation_checkpoint(
     return step
 
 
+# (id(vae), device str, dtype) -> (mean, inv_std) shaped [1,C,1,1,1] on device
+_WAN_LATENTS_NORM_BUFFERS: dict[tuple[int, str, torch.dtype], tuple[torch.Tensor,
+                                                                     torch.Tensor]] = {}
+
+
 def normalize_dit_input(model_type, latents, vae) -> torch.Tensor:
     if model_type == "hunyuan_hf" or model_type == "hunyuan":
         return latents * vae.config.scaling_factor
     elif model_type == "wan":
-        latents_mean = torch.tensor(vae.latents_mean)
-        latents_std = 1.0 / torch.tensor(vae.latents_std)
-
-        latents_mean = latents_mean.view(1, -1, 1, 1, 1).to(device=latents.device)
-        latents_std = latents_std.view(1, -1, 1, 1, 1).to(device=latents.device)
-        latents = ((latents.float() - latents_mean) * latents_std).to(latents)
+        key = (id(vae), str(latents.device), latents.dtype)
+        cached = _WAN_LATENTS_NORM_BUFFERS.get(key)
+        if cached is None:
+            latents_mean = torch.as_tensor(
+                vae.latents_mean,
+                device=latents.device,
+                dtype=torch.float32,
+            ).view(1, -1, 1, 1, 1)
+            latents_std = (1.0 / torch.as_tensor(
+                vae.latents_std,
+                device=latents.device,
+                dtype=torch.float32,
+            )).view(1, -1, 1, 1, 1)
+            _WAN_LATENTS_NORM_BUFFERS[key] = (latents_mean, latents_std)
+        else:
+            latents_mean, latents_std = cached
+        latents = ((latents.float() - latents_mean) * latents_std).to(latents.dtype)
         return latents
     else:
         raise NotImplementedError(f"model_type {model_type} not supported")

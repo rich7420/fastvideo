@@ -39,6 +39,9 @@ if TYPE_CHECKING:
     FASTVIDEO_STAGE_LOGGING: bool = False
     FASTVIDEO_HOST_IP: str = ""
     FASTVIDEO_LOOPBACK_IP: str = ""
+    FASTVIDEO_SP_SEED_SYNC: str = ""
+    FASTVIDEO_METRIC_MATERIALIZE_INTERVAL: str = ""
+    FASTVIDEO_WRITE_BASELINE_METRICS: str = ""
 
 
 def get_default_cache_root() -> str:
@@ -262,6 +265,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # taken for each stage
     "FASTVIDEO_STAGE_LOGGING":
     lambda: bool(int(os.getenv("FASTVIDEO_STAGE_LOGGING", "0"))),
+
+    # Legacy training: SP group noise sync (``1`` = broadcast int seed + local
+    # randn; ``0`` = full timesteps/noise tensor broadcast).
+    "FASTVIDEO_SP_SEED_SYNC":
+    lambda: os.getenv("FASTVIDEO_SP_SEED_SYNC", ""),
+
+    # Legacy training: how often loss / grad_norm are materialized to CPU scalars.
+    "FASTVIDEO_METRIC_MATERIALIZE_INTERVAL":
+    lambda: os.getenv("FASTVIDEO_METRIC_MATERIALIZE_INTERVAL", ""),
+
+    # If ``1``, rank 0 writes ``baseline_metrics_from_train.json`` under
+    # ``output_dir`` at end of ``TrainingPipeline.train`` (Modal baseline).
+    "FASTVIDEO_WRITE_BASELINE_METRICS":
+    lambda: os.getenv("FASTVIDEO_WRITE_BASELINE_METRICS", ""),
 }
 
 # end-env-vars-definition

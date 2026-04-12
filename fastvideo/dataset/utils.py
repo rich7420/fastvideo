@@ -1,8 +1,32 @@
+import math
 import random
 from typing import Any, cast
 
 import numpy as np
 import torch
+
+
+def _bytes_to_float32_tensor(bytes_data: bytes, shape: list | tuple) -> torch.Tensor:
+    """Decode float32 row bytes to an owning CPU tensor (single ``numpy`` copy).
+
+    Centralizes the former ``np.frombuffer(...).reshape(...).copy()`` +
+    ``torch.from_numpy`` path. Immutable ``bytes`` force one explicit copy
+    before ``torch.from_numpy`` so the tensor is safe to use with padding and
+    ``torch.stack`` without PyTorch non-writable-buffer warnings.
+    """
+    shape_t = tuple(int(x) for x in shape)
+    if len(bytes_data) == 0:
+        return torch.empty(shape_t, dtype=torch.float32)
+    numel = math.prod(shape_t)
+    if numel * 4 != len(bytes_data):
+        raise ValueError(
+            f"bytes length {len(bytes_data)} != numel({numel})*4 for shape {shape_t}")
+    arr = np.frombuffer(
+        bytes_data,
+        dtype=np.float32,
+        count=numel,
+    ).reshape(shape_t).copy()
+    return torch.from_numpy(arr)
 
 
 def pad(t: torch.Tensor, padding_length: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -48,10 +72,9 @@ def get_torch_tensors_from_row_dict(row_dict,
         # TODO (peiyuan): read precision
         if key == 'text_embedding' and (rng.random()
                                         if rng else random.random()) < cfg_rate:
-            data = np.zeros((512, 4096), dtype=np.float32)
+            data = torch.zeros((512, 4096), dtype=torch.float32)
         else:
-            data = np.frombuffer(bytes, dtype=np.float32).reshape(shape).copy()
-        data = torch.from_numpy(data)
+            data = _bytes_to_float32_tensor(bytes, shape)
         if len(data.shape) == 3:
             B, L, D = data.shape
             assert B == 1, "Batch size must be 1"
@@ -167,14 +190,9 @@ def collate_rows_from_parquet_schema(rows,
                                      random.random())
                                     < cfg_rate)
                     if drop:
-                        data = np.zeros(
-                            (512, 4096), dtype=np.float32)
+                        tensor = torch.zeros((512, 4096), dtype=torch.float32)
                     else:
-                        data = np.frombuffer(
-                            bytes_data,
-                            dtype=np.float32,
-                        ).reshape(shape).copy()
-                    tensor = torch.from_numpy(data)
+                        tensor = _bytes_to_float32_tensor(bytes_data, shape)
                     # if len(data.shape) == 3:
                     #     B, L, D = tensor.shape
                     #     assert B == 1, "Batch size must be 1"

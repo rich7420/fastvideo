@@ -275,8 +275,8 @@ class TrainingBatch:
     loss: torch.Tensor | None = None
 
     # Training outputs
-    total_loss: float | None = None
-    grad_norm: float | None = None
+    total_loss: torch.Tensor | float | None = None
+    grad_norm: torch.Tensor | float | None = None
 
     # Distillation-specific attributes
     encoder_hidden_states_neg: torch.Tensor | None = None

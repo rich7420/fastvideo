@@ -2,6 +2,7 @@
 import os
 import pickle
 import random
+from collections import defaultdict
 from typing import Any
 
 import pyarrow as pa
@@ -203,6 +204,75 @@ def get_parquet_files_and_length(path: str):
     return file_names_sorted, lengths_sorted
 
 
+def _global_row_index_to_file_and_local(lengths: list[int],
+                                        global_row_idx: int) -> tuple[int, int]:
+    """Map a dataset-global row index to (parquet file index, row index in file)."""
+    cumulative = 0
+    for file_index in range(len(lengths)):
+        if cumulative + lengths[file_index] > global_row_idx:
+            return file_index, global_row_idx - cumulative
+        cumulative += lengths[file_index]
+    raise IndexError(
+        f"global_row_idx {global_row_idx} is out of bounds for dataset")
+
+
+def _local_row_to_row_group_metadata(parquet_file: pq.ParquetFile,
+                                     local_row_idx: int) -> tuple[int, int]:
+    """Map file-local row index to (row_group_index, index inside that group)."""
+    cumulative = 0
+    for i in range(parquet_file.num_row_groups):
+        num_rows = parquet_file.metadata.row_group(i).num_rows
+        if cumulative + num_rows > local_row_idx:
+            return i, local_row_idx - cumulative
+        cumulative += num_rows
+    raise IndexError(
+        f"local_row_idx {local_row_idx} is out of bounds for parquet file")
+
+
+def read_rows_map_style_batch(parquet_files: list[str], indices: list[int],
+                              lengths: list[int]) -> list[dict[str, Any]]:
+    """Read many rows, de-duplicating Parquet row-group reads (I/O hot path)."""
+    if not indices:
+        return []
+
+    groups: dict[tuple[int, int], list[tuple[int, int]]] = defaultdict(list)
+    file_handles: dict[int, pq.ParquetFile] = {}
+
+    def _get_pf(file_i: int) -> pq.ParquetFile:
+        if file_i not in file_handles:
+            file_handles[file_i] = pq.ParquetFile(parquet_files[file_i])
+        return file_handles[file_i]
+
+    try:
+        for pos, global_idx in enumerate(indices):
+            file_i, local_row = _global_row_index_to_file_and_local(
+                lengths, global_idx)
+            pf = _get_pf(file_i)
+            rg_i, local_in_rg = _local_row_to_row_group_metadata(pf, local_row)
+            groups[(file_i, rg_i)].append((pos, local_in_rg))
+
+        rows: list[dict[str, Any] | None] = [None] * len(indices)
+        for (file_i, rg_i), members in groups.items():
+            pf = _get_pf(file_i)
+            row_group = pf.read_row_group(rg_i).to_pydict()
+            for pos, local_in_rg in members:
+                rows[pos] = {
+                    k: v[local_in_rg]
+                    for k, v in row_group.items()
+                }
+            del row_group
+
+        if any(r is None for r in rows):
+            raise RuntimeError("read_rows_map_style_batch: internal fill error")
+        return rows  # type: ignore[return-value]
+    finally:
+        for pf in file_handles.values():
+            try:
+                pf.close()
+            except Exception:
+                pass
+
+
 def read_row_from_parquet_file(parquet_files: list[str], global_row_idx: int,
                                lengths: list[int]) -> dict[str, Any]:
     '''
@@ -213,47 +283,8 @@ def read_row_from_parquet_file(parquet_files: list[str], global_row_idx: int,
         lengths: List[int]
     Returns:
     '''
-    # find the parquet file and local row index
-    cumulative = 0
-    file_index = 0
-    local_row_idx = 0
-
-    for file_index in range(len(lengths)):
-        if cumulative + lengths[file_index] > global_row_idx:
-            local_row_idx = global_row_idx - cumulative
-            break
-        cumulative += lengths[file_index]
-    else:
-        # If we reach here, global_row_idx is out of bounds
-        raise IndexError(
-            f"global_row_idx {global_row_idx} is out of bounds for dataset")
-
-    parquet_file = pq.ParquetFile(parquet_files[file_index])
-
-    # Calculate the row group to read into memory and the local idx
-    # This way we can avoid reading in the entire parquet file
-    cumulative = 0
-    row_group_index = 0
-    local_index = 0
-
-    for i in range(parquet_file.num_row_groups):
-        num_rows = parquet_file.metadata.row_group(i).num_rows
-        if cumulative + num_rows > local_row_idx:
-            row_group_index = i
-            local_index = local_row_idx - cumulative
-            break
-        cumulative += num_rows
-    else:
-        # If we reach here, local_row_idx is out of bounds for this parquet file
-        raise IndexError(
-            f"local_row_idx {local_row_idx} is out of bounds for parquet file {parquet_files[file_index]}"
-        )
-
-    row_group = parquet_file.read_row_group(row_group_index).to_pydict()
-    row_dict = {k: v[local_index] for k, v in row_group.items()}
-    del row_group
-
-    return row_dict
+    return read_rows_map_style_batch(parquet_files, [global_row_idx],
+                                     lengths)[0]
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -336,12 +367,10 @@ class LatentsParquetMapStyleDataset(Dataset):
     # PyTorch calls this ONLY because the batch_sampler yields a list
     def __getitems__(self, indices: list[int]) -> dict[str, Any]:
         """
-        Batch fetch using read_row_from_parquet_file for each index.
+        Batch fetch with one Parquet row-group read per unique (file, row_group).
         """
-        rows = [
-            read_row_from_parquet_file(self.parquet_files, idx, self.lengths)
-            for idx in indices
-        ]
+        rows = read_rows_map_style_batch(self.parquet_files, indices,
+                                         self.lengths)
 
         # Inject sample indices for deterministic CFG dropout
         # that is reproducible across checkpoint resume.

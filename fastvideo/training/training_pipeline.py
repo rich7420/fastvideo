@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 from dataclasses import asdict
+import json
 import math
 import os
 import shutil
@@ -221,9 +222,9 @@ class TrainingPipeline(LoRAPipeline, ABC):
         raise NotImplementedError("Training pipelines must implement this method")
 
     def _prepare_training(self, training_batch: TrainingBatch) -> TrainingBatch:
-        self.optimizer.zero_grad()
+        self.optimizer.zero_grad(set_to_none=True)
         if self.transformer_2 is not None:
-            self.optimizer_2.zero_grad()
+            self.optimizer_2.zero_grad(set_to_none=True)
         training_batch.total_loss = 0.0
         return training_batch
 
@@ -282,17 +283,54 @@ class TrainingPipeline(LoRAPipeline, ABC):
         with self.tracker.timed("timing/prepare_dit_inputs"):
             latents = training_batch.latents
             batch_size = latents.shape[0]
-            noise = torch.randn(latents.shape,
-                                generator=self.noise_gen_cuda,
-                                device=latents.device,
-                                dtype=latents.dtype)
-            timesteps = self._sample_timesteps(batch_size, latents.device)
+            use_sp_seed_sync = os.environ.get(
+                "FASTVIDEO_SP_SEED_SYNC",
+                "1",
+            ) == "1"
+            step_seed: int | None = None
+            if self.training_args.sp_size > 1 and use_sp_seed_sync:
+                # Broadcast only one small scalar seed within SP group, then
+                # generate full tensors locally to avoid large per-step broadcasts.
+                sp_group = get_sp_group()
+                seed_tensor = torch.randint(
+                    low=0,
+                    high=2**31 - 1,
+                    size=(1,),
+                    generator=self.noise_gen_cuda,
+                    device=latents.device,
+                    dtype=torch.int64,
+                )
+                sp_group.broadcast(seed_tensor, src=0)
+                step_seed = int(seed_tensor.item())
+                local_noise_gen = torch.Generator(
+                    device=current_platform.device_name
+                ).manual_seed(step_seed)
+                noise = torch.randn(
+                    latents.shape,
+                    generator=local_noise_gen,
+                    device=latents.device,
+                    dtype=latents.dtype,
+                )
+            else:
+                noise = torch.randn(
+                    latents.shape,
+                    generator=self.noise_gen_cuda,
+                    device=latents.device,
+                    dtype=latents.dtype,
+                )
+            timesteps = self._sample_timesteps(
+                batch_size,
+                latents.device,
+                step_seed=step_seed,
+            )
 
             if self.training_args.sp_size > 1:
-                # Make sure that the timesteps are the same across all sp processes.
-                sp_group = get_sp_group()
-                sp_group.broadcast(timesteps, src=0)
-                sp_group.broadcast(noise, src=0)
+                # Keep backward compatibility for debugging by allowing the old
+                # full-tensor broadcast path via FASTVIDEO_SP_SEED_SYNC=0.
+                if not use_sp_seed_sync:
+                    sp_group = get_sp_group()
+                    sp_group.broadcast(timesteps, src=0)
+                    sp_group.broadcast(noise, src=0)
             sigmas = get_sigmas(
                 self.noise_scheduler,
                 latents.device,
@@ -310,10 +348,18 @@ class TrainingPipeline(LoRAPipeline, ABC):
 
         return training_batch
 
-    def _sample_timesteps(self, batch_size: int, device: torch.device) -> torch.Tensor:
+    def _sample_timesteps(
+        self,
+        batch_size: int,
+        device: torch.device,
+        step_seed: int | None = None,
+    ) -> torch.Tensor:
+        local_generator = self.noise_random_generator
+        if step_seed is not None:
+            local_generator = torch.Generator(device="cpu").manual_seed(step_seed)
         # Determine which model to train based on the boundary timestep
         if (self.transformer_2 is not None and self.boundary_timestep is not None
-                and torch.rand(1, generator=self.noise_random_generator).item() <= self.training_args.boundary_ratio):
+                and torch.rand(1, generator=local_generator).item() <= self.training_args.boundary_ratio):
             self.train_transformer_2 = True
         else:
             self.train_transformer_2 = False
@@ -327,7 +373,7 @@ class TrainingPipeline(LoRAPipeline, ABC):
         u = compute_density_for_timestep_sampling(
             weighting_scheme=self.training_args.weighting_scheme,
             batch_size=batch_size,
-            generator=self.noise_random_generator,
+            generator=local_generator,
             logit_mean=self.training_args.logit_mean,
             logit_std=self.training_args.logit_std,
             mode_scale=self.training_args.mode_scale,
@@ -423,18 +469,13 @@ class TrainingPipeline(LoRAPipeline, ABC):
 
             avg_loss = loss.detach().clone()
 
-        # Reduce across ranks without forcing a CPU sync
-        with self.tracker.timed("timing/reduce_loss"):
-            world_group = get_world_group()
-            avg_loss = world_group.all_reduce(avg_loss, op=dist.ReduceOp.AVG)
-        # Accumulate on GPU; materialize to CPU only once after
-        # all gradient-accumulation iterations (see train_one_step).
-        if training_batch.total_loss == 0.0:
+        # Sum local micro-batch losses on GPU; one world all_reduce(AVG) after
+        # the full grad-accum loop is equivalent to summing per-microstep
+        # all_reduce(AVG) but uses fewer collectives when accum_steps > 1.
+        if not isinstance(training_batch.total_loss, torch.Tensor):
             training_batch.total_loss = avg_loss
         else:
-            training_batch.total_loss = (
-                training_batch.total_loss + avg_loss
-            )
+            training_batch.total_loss = training_batch.total_loss + avg_loss
 
         return training_batch
 
@@ -458,7 +499,11 @@ class TrainingPipeline(LoRAPipeline, ABC):
                     foreach=None,
                 )
                 assert grad_norm is not float('nan') or grad_norm is not float('inf')
-                grad_norm = grad_norm.item() if grad_norm is not None else 0.0
+                if isinstance(grad_norm, torch.Tensor):
+                    # Keep grad norm on GPU; only materialize to CPU periodically.
+                    grad_norm = grad_norm.detach()
+                else:
+                    grad_norm = 0.0 if grad_norm is None else grad_norm
         else:
             grad_norm = 0.0
         training_batch.grad_norm = grad_norm
@@ -488,6 +533,13 @@ class TrainingPipeline(LoRAPipeline, ABC):
             training_batch = self._build_input_kwargs(training_batch)
 
             training_batch = self._transformer_forward_and_compute_loss(training_batch)
+
+        assert isinstance(training_batch.total_loss, torch.Tensor)
+        if dist.is_initialized() and get_world_group().world_size > 1:
+            with self.tracker.timed("timing/reduce_loss"):
+                world_group = get_world_group()
+                training_batch.total_loss = world_group.all_reduce(
+                    training_batch.total_loss, op=dist.ReduceOp.AVG)
 
         training_batch = self._clip_grad_norm(training_batch)
 
@@ -557,6 +609,15 @@ class TrainingPipeline(LoRAPipeline, ABC):
             # Only show the progress bar once on each machine.
             disable=self.local_rank > 0,
         )
+        metric_interval_raw = (
+            os.environ.get("FASTVIDEO_METRIC_MATERIALIZE_INTERVAL") or "10"
+        )
+        metric_materialize_interval = max(1, int(metric_interval_raw))
+        checkpointing_enabled = (
+            self.training_args.training_state_checkpointing_steps > 0
+        )
+        last_loss_for_postfix = float("nan")
+        last_grad_norm_for_postfix: float | str = "-"
         for step in range(self.init_steps + 1, self.training_args.max_train_steps + 1):
             start_time = time.perf_counter()
             if vsa_available:
@@ -576,32 +637,49 @@ class TrainingPipeline(LoRAPipeline, ABC):
             training_batch.current_vsa_sparsity = current_vsa_sparsity
             training_batch = self.train_one_step(training_batch)
 
-            loss = (
-                float(training_batch.total_loss.item())
-                if isinstance(training_batch.total_loss, torch.Tensor)
-                else float(training_batch.total_loss)
+            should_materialize_scalars = (
+                step == self.init_steps + 1
+                or step == self.training_args.max_train_steps
+                or step % metric_materialize_interval == 0
             )
-            grad_norm = training_batch.grad_norm
+            loss: float | None = None
+            grad_norm: float | None = None
+            if should_materialize_scalars:
+                loss = (
+                    float(training_batch.total_loss.item())
+                    if isinstance(training_batch.total_loss, torch.Tensor)
+                    else float(training_batch.total_loss)
+                )
+                if isinstance(training_batch.grad_norm, torch.Tensor):
+                    grad_norm = float(training_batch.grad_norm.item())
+                elif training_batch.grad_norm is not None:
+                    grad_norm = float(training_batch.grad_norm)
+                else:
+                    grad_norm = 0.0
+                last_loss_for_postfix = loss
+                last_grad_norm_for_postfix = grad_norm
 
             step_time = time.perf_counter() - start_time
             step_times.append(step_time)
             avg_step_time = sum(step_times) / len(step_times)
 
             progress_bar.set_postfix({
-                "loss": f"{loss:.4f}",
+                "loss": f"{last_loss_for_postfix:.4f}",
                 "step_time": f"{step_time:.2f}s",
-                "grad_norm": grad_norm,
+                "grad_norm": last_grad_norm_for_postfix,
             })
             progress_bar.update(1)
             if self.global_rank == 0:
                 metrics = {
-                    "train_loss": loss,
                     "learning_rate": self.lr_scheduler.get_last_lr()[0],
                     "step_time": step_time,
                     "avg_step_time": avg_step_time,
-                    "grad_norm": grad_norm,
                     "vsa_sparsity": current_vsa_sparsity,
                 }
+                if loss is not None:
+                    metrics["train_loss"] = loss
+                if grad_norm is not None:
+                    metrics["grad_norm"] = grad_norm
                 try:
                     metrics["batch_size"] = int(training_batch.raw_latent_shape[0])
 
@@ -625,7 +703,10 @@ class TrainingPipeline(LoRAPipeline, ABC):
                     pass
 
                 self.tracker.log(metrics, step)
-            if step % self.training_args.training_state_checkpointing_steps == 0:
+            if (
+                checkpointing_enabled
+                and step % self.training_args.training_state_checkpointing_steps == 0
+            ):
                 with self.profiler_controller.region("profiler_region_training_save_checkpoint"):
                     save_checkpoint(self.transformer, self.global_rank, self.training_args.output_dir, step,
                                     self.optimizer, self.train_dataloader, self.lr_scheduler,
@@ -645,9 +726,40 @@ class TrainingPipeline(LoRAPipeline, ABC):
                                 trainable_params)
 
         self.tracker.finish()
-        save_checkpoint(self.transformer, self.global_rank, self.training_args.output_dir,
-                        self.training_args.max_train_steps, self.optimizer, self.train_dataloader, self.lr_scheduler,
-                        self.noise_random_generator)
+        if (
+            self.global_rank == 0
+            and os.environ.get("FASTVIDEO_WRITE_BASELINE_METRICS", "") == "1"
+            and self.training_args is not None
+        ):
+            out_dir = self.training_args.output_dir or "."
+            os.makedirs(out_dir, exist_ok=True)
+            train_path = os.path.join(out_dir, "baseline_metrics_from_train.json")
+            avg_st = (
+                sum(step_times) / len(step_times) if step_times else 0.0
+            )
+            last_st = float(step_times[-1]) if step_times else 0.0
+            lr0 = float(self.lr_scheduler.get_last_lr()[0])
+            payload: dict[str, Any] = {
+                "avg_step_time": avg_st,
+                "step_time": last_st,
+                "learning_rate": lr0,
+            }
+            if not (
+                isinstance(last_loss_for_postfix, float)
+                and math.isnan(last_loss_for_postfix)
+            ):
+                if isinstance(last_loss_for_postfix, (int, float)):
+                    payload["train_loss"] = float(last_loss_for_postfix)
+            if isinstance(last_grad_norm_for_postfix, (int, float)):
+                payload["grad_norm"] = float(last_grad_norm_for_postfix)
+            payload["source"] = "training_pipeline"
+            with open(train_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2)
+            logger.info("Wrote %s for baseline metrics collection.", train_path)
+        if checkpointing_enabled:
+            save_checkpoint(self.transformer, self.global_rank, self.training_args.output_dir,
+                            self.training_args.max_train_steps, self.optimizer, self.train_dataloader, self.lr_scheduler,
+                            self.noise_random_generator)
 
         if envs.FASTVIDEO_TORCH_PROFILER_DIR:
             logger.info("Stopping profiler...")
