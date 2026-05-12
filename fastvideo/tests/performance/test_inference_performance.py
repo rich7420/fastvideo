@@ -119,7 +119,7 @@ def _avg_component(all_component_times: list[dict], key: str) -> float | None:
 
 
 def _run_generation(generator, prompt, generation_kwargs):
-    """Run a single generation, return (elapsed_s, peak_memory_mb, component_times)."""
+    """Run a single generation, return (elapsed_s, peak_memory_mb, component_times, stage_times)."""
     torch.cuda.synchronize()
     start = time.perf_counter()
     result = generator.generate_video(prompt, **generation_kwargs)
@@ -127,7 +127,18 @@ def _run_generation(generator, prompt, generation_kwargs):
     elapsed = time.perf_counter() - start
     peak_memory_mb = result.get("peak_memory_mb", 0.0) or 0.0
     component_times = _extract_component_times(result)
-    return elapsed, peak_memory_mb, component_times
+    # Per-stage breakdown is populated when FASTVIDEO_STAGE_LOGGING=1.
+    # Keys are stage class names (TextEncodingStage, DenoisingStage, ...).
+    stage_times: dict[str, float] = {}
+    logging_info = result.get("logging_info")
+    if logging_info is not None:
+        stages = (logging_info.get("stages", {}) if isinstance(logging_info, Mapping)
+                  else getattr(logging_info, "stages", {})) or {}
+        for stage_name, info in stages.items():
+            t = info.get("execution_time")
+            if t is not None:
+                stage_times[stage_name] = float(t)
+    return elapsed, peak_memory_mb, component_times, stage_times
 
 def _write_results(results):
     """Write JSON results to the results directory."""
@@ -164,6 +175,11 @@ def _run_benchmark(cfg):
     num_measure = run_config.get("num_measurement_runs", 3)
     thresholds = _get_thresholds(cfg)
 
+    # Opt into per-stage timing via PipelineStage.__call__ instrumentation.
+    # Must be set before VideoGenerator spawns worker subprocesses so they
+    # inherit it. NVTX ranges are emitted regardless of this flag.
+    os.environ["FASTVIDEO_STAGE_LOGGING"] = "1"
+
     # Remap JSON keys to VideoGenerator kwargs
     text_enc_prec = init_kwargs.pop("text_encoder_precisions", None)
     if text_enc_prec is not None:
@@ -189,10 +205,11 @@ def _run_benchmark(cfg):
 
         times = []
         peak_memories = []
-        all_component_times = []
+        all_component_times: list[dict] = []
+        stage_times_per_run: list[dict[str, float]] = []
         for i in range(num_measure):
             logger.info("Measurement run %d/%d", i + 1, num_measure)
-            elapsed, peak_mb, component_times = _run_generation(
+            elapsed, peak_mb, component_times, stage_times = _run_generation(
                 generator,
                 prompt,
                 gen_kwargs,
@@ -201,6 +218,7 @@ def _run_benchmark(cfg):
             times.append(elapsed)
             peak_memories.append(peak_mb)
             all_component_times.append(component_times)
+            stage_times_per_run.append(stage_times)
     finally:
         _shutdown_executor(generator)
 
@@ -211,6 +229,17 @@ def _run_benchmark(cfg):
     throughput_fps = (1.0 / avg_time) if avg_time > 0 else None
     if isinstance(num_frames, (int, float)) and avg_time > 0:
         throughput_fps = num_frames / avg_time
+
+    # Average per-stage times across measurement runs (only stages present in
+    # every run survive; stages that appear in some runs go in per_run_stage_times_s).
+    avg_stage_times: dict[str, float] = {}
+    if stage_times_per_run and stage_times_per_run[0]:
+        common_stages = set(stage_times_per_run[0].keys())
+        for run in stage_times_per_run[1:]:
+            common_stages &= set(run.keys())
+        for stage in common_stages:
+            vals = [run[stage] for run in stage_times_per_run]
+            avg_stage_times[stage] = round(sum(vals) / len(vals), 4)
 
     results = {
         "benchmark_id": cfg["benchmark_id"],
@@ -225,6 +254,8 @@ def _run_benchmark(cfg):
         if throughput_fps is not None else None,
         "max_peak_memory_mb": round(max_peak_memory, 1),
         "individual_peak_memories_mb": [round(m, 1) for m in peak_memories],
+        "avg_stage_times_s": avg_stage_times,
+        "per_run_stage_times_s": stage_times_per_run,
         "thresholds": thresholds,
         "commit": os.environ.get("BUILDKITE_COMMIT", ""),
         "pr_number": os.environ.get("BUILDKITE_PULL_REQUEST", ""),

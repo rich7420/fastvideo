@@ -142,28 +142,32 @@ class PipelineStage(ABC):
                 logger.error("Input verification failed for %s: %s", stage_name, str(e))
                 raise
 
-        # Execute the actual stage logic
-        if envs.FASTVIDEO_STAGE_LOGGING:
-            logger.info("[%s] Starting execution", stage_name)
-            torch.cuda.synchronize()
-            start_time = time.perf_counter()
+        # Execute the actual stage logic.
+        # NVTX range is always emitted (cheap, useful for nsys traces).
+        # Per-stage timing only runs when FASTVIDEO_STAGE_LOGGING is set
+        # because cuda.synchronize() adds non-trivial overhead.
+        with torch.cuda.nvtx.range(f"stage::{stage_name}"):
+            if envs.FASTVIDEO_STAGE_LOGGING:
+                logger.info("[%s] Starting execution", stage_name)
+                torch.cuda.synchronize()
+                start_time = time.perf_counter()
 
-            try:
+                try:
+                    result = self.forward(batch, fastvideo_args)
+                    torch.cuda.synchronize()
+                    execution_time = time.perf_counter() - start_time
+                    logger.info("[%s] Execution completed in %s ms", stage_name, execution_time * 1000)
+                    batch.logging_info.add_stage_execution_time(stage_key, execution_time)
+                    batch.logging_info.add_stage_metric(stage_key, "stage_class", stage_class_name)
+                except Exception as e:
+                    torch.cuda.synchronize()
+                    execution_time = time.perf_counter() - start_time
+                    logger.error("[%s] Error during execution after %s ms: %s", stage_name, execution_time * 1000, e)
+                    logger.error("[%s] Traceback: %s", stage_name, traceback.format_exc())
+                    raise
+            else:
+                # Direct execution (current behavior)
                 result = self.forward(batch, fastvideo_args)
-                torch.cuda.synchronize()
-                execution_time = time.perf_counter() - start_time
-                logger.info("[%s] Execution completed in %s ms", stage_name, execution_time * 1000)
-                batch.logging_info.add_stage_execution_time(stage_key, execution_time)
-                batch.logging_info.add_stage_metric(stage_key, "stage_class", stage_class_name)
-            except Exception as e:
-                torch.cuda.synchronize()
-                execution_time = time.perf_counter() - start_time
-                logger.error("[%s] Error during execution after %s ms: %s", stage_name, execution_time * 1000, e)
-                logger.error("[%s] Traceback: %s", stage_name, traceback.format_exc())
-                raise
-        else:
-            # Direct execution (current behavior)
-            result = self.forward(batch, fastvideo_args)
 
         if enable_verification:
             # Post-execution output verification
