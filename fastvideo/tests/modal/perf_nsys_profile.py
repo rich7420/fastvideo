@@ -47,7 +47,14 @@ results_vol = modal.Volume.from_name(
 )
 
 # Repo root: <repo>/fastvideo/tests/modal/perf_nsys_profile.py -> <repo>
-_DEFAULT_LOCAL_ROOT = pathlib.Path(__file__).resolve().parents[3]
+# Modal re-imports this module inside the container where the path layout
+# is different (script lives at /root/perf_nsys_profile.py). The container
+# never actually mounts code from a local path, so we just need a value
+# that won't IndexError at import.
+try:
+    _DEFAULT_LOCAL_ROOT = pathlib.Path(__file__).resolve().parents[3]
+except IndexError:
+    _DEFAULT_LOCAL_ROOT = pathlib.Path("/FastVideo")
 LOCAL_ROOT = pathlib.Path(
     os.environ.get("FASTVIDEO_LOCAL_ROOT", str(_DEFAULT_LOCAL_ROOT)))
 
@@ -96,6 +103,12 @@ image = (
         "  > /etc/apt/sources.list.d/nvidia-devtools.list && "
         "apt-get update && "
         "apt-get install -y --no-install-recommends nsight-systems-cli"
+    ).run_commands(
+        # Wipe the image's pre-baked /FastVideo before overlaying local
+        # source — otherwise stale subdirs from old builds (e.g. removed
+        # stepvideo pipeline) get walked by pkgutil and break imports.
+        # fastvideo_kernel lives in site-packages, so this is safe.
+        "rm -rf /FastVideo"
     ).add_local_dir(
         str(LOCAL_ROOT),
         remote_path="/FastVideo",
@@ -127,8 +140,13 @@ def run_perf_nsys(benchmark_id: str = "wan-t2v-1.3b-l40s-hires") -> int:
     # markers), --cpuctxsw/--sample=none (suppress QuadD errors on Modal).
     # `;` instead of `&&` after pytest so the trace is copied even when
     # pytest exits non-zero (threshold violation is expected on first run).
+    # --assert=plain: disable assertion rewriting to dodge a Python 3.12 +
+    # pytest 8 + anyio bug where rewrite.find_spec gets a non-string path
+    # ("'AssertionRewritingHook' object has no attribute 'rpartition'").
+    # Our threshold asserts work fine without rewriting.
     pytest_cmd = (
-        f"pytest -vs ./fastvideo/tests/performance/test_inference_performance.py "
+        f"pytest -vs --assert=plain "
+        f"./fastvideo/tests/performance/test_inference_performance.py "
         f"-k {benchmark_id}")
     command = (
         "set +e && "
@@ -193,13 +211,92 @@ def run_perf_nsys(benchmark_id: str = "wan-t2v-1.3b-l40s-hires") -> int:
     return int(result.returncode)
 
 
+@app.function(
+    gpu="L40S:2",
+    image=image,
+    timeout=3600,
+    memory=65536,
+    secrets=[modal.Secret.from_dict({"HF_API_KEY": os.environ.get("HF_API_KEY", "")})],
+    volumes={"/root/data": model_vol, "/results": results_vol},
+)
+def run_perf_nsys_sp2(benchmark_id: str = "wan-t2v-1.3b-l40s-hires-sp2") -> int:
+    # Mirrors run_perf_nsys but targets 2x L40S. Output filenames use the
+    # benchmark_id, so the sp=2 trace lands at /results/perf_sp2.nsys-rep to
+    # avoid clobbering the baseline.
+    print(f"[perf-nsys-sp2] benchmark_id={benchmark_id}")
+
+    profile_env = {
+        **os.environ,
+        "PYTHONUNBUFFERED": "1",
+        "FASTVIDEO_STAGE_LOGGING": "1",
+        "HF_HOME": "/root/data/.cache",
+    }
+    pytest_cmd = (
+        f"pytest -vs --assert=plain "
+        f"./fastvideo/tests/performance/test_inference_performance.py "
+        f"-k {benchmark_id}")
+    command = (
+        "set +e && "
+        "source /opt/venv/bin/activate && "
+        "cd /FastVideo && "
+        '( [ -z "${HF_API_KEY:-}" ] || hf auth login --token "$HF_API_KEY" --quiet || true ) && '
+        "NSYS_CFG=$(nsys -z 2>/dev/null || true) && "
+        "if [ -n \"$NSYS_CFG\" ]; then "
+        "  mkdir -p \"$(dirname \"$NSYS_CFG\")\" && "
+        "  echo 'CuptiUseRawGpuTimestamps=false' >> \"$NSYS_CFG\"; "
+        "fi && "
+        "nsys profile "
+        "  --force-overwrite=true "
+        "  -o /tmp/perf_sp2 "
+        "  --trace=cuda,nvtx "
+        "  --pytorch=autograd-nvtx "
+        "  --cpuctxsw=none "
+        "  --sample=none "
+        "  --stats=false "
+        f" -- bash -c '{pytest_cmd}' ; "
+        "PYTEST_RC=$? ; "
+        "cp -v /tmp/perf_sp2.nsys-rep /results/perf_sp2.nsys-rep 2>&1 || true ; "
+        "mkdir -p /results/perf_json && "
+        "find ./fastvideo/tests/performance/results -name 'perf_*.json' "
+        "  -exec cp -v {} /results/perf_json/ \\; 2>&1 || true ; "
+        "exit $PYTEST_RC")
+
+    result = subprocess.run(
+        ["/bin/bash", "-c", command],
+        env=profile_env,
+        stdout=sys.stdout,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    stderr_text = (result.stderr or b"").decode(errors="replace")
+    if stderr_text:
+        sys.stderr.write(stderr_text)
+
+    try:
+        results_vol.commit()
+    except Exception as exc:
+        print(f"[perf-nsys-sp2] volume commit failed: {exc}", file=sys.stderr)
+
+    has_nsys = os.path.isfile("/results/perf_sp2.nsys-rep")
+    print(f"\n[perf-nsys-sp2] === Outcome === pytest={result.returncode}, nsys={'OK' if has_nsys else 'MISSING'}")
+    return int(result.returncode)
+
+
 @app.local_entrypoint()
 def main() -> None:
-    benchmark_id = os.environ.get("PERF_BENCHMARK_ID", "wan-t2v-1.3b-l40s-hires")
-    print(f"[local] benchmark_id={benchmark_id}")
-    print(f"[local] uploading source from: {LOCAL_ROOT}")
-    exit_code = run_perf_nsys.remote(benchmark_id=benchmark_id)
+    # PERF_GPU_COUNT=2 selects the sp=2 path; defaults to the original 4x L40S run.
+    gpu_count = int(os.environ.get("PERF_GPU_COUNT", "4"))
+    if gpu_count == 2:
+        benchmark_id = os.environ.get("PERF_BENCHMARK_ID", "wan-t2v-1.3b-l40s-hires-sp2")
+        print(f"[local] gpu_count=2, benchmark_id={benchmark_id}")
+        print(f"[local] uploading source from: {LOCAL_ROOT}")
+        exit_code = run_perf_nsys_sp2.remote(benchmark_id=benchmark_id)
+    else:
+        benchmark_id = os.environ.get("PERF_BENCHMARK_ID", "wan-t2v-1.3b-l40s-hires")
+        print(f"[local] gpu_count=4, benchmark_id={benchmark_id}")
+        print(f"[local] uploading source from: {LOCAL_ROOT}")
+        exit_code = run_perf_nsys.remote(benchmark_id=benchmark_id)
     if exit_code != 0:
         print(f"[local] pytest exit code: {exit_code} "
               "(non-zero may just mean threshold violation; "
-              "check Modal volume for perf.nsys-rep)")
+              "check Modal volume for perf*.nsys-rep)")

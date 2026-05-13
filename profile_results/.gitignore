@@ -1,0 +1,7 @@
+# Large binary trace artifacts — don't commit, regenerate via Modal
+*.nsys-rep
+*.sqlite
+*.qdstrm
+*.nsys-cache/
+.parquet_build_*/
+generated_videos/

@@ -1,0 +1,55 @@
+{
+  "benchmark_id": "wan-t2v-1.3b-l40s-hires",
+  "model_short_name": "Wan2.1-T2V-1.3B",
+  "device": "NVIDIA L40S",
+  "num_gpus": 4,
+  "num_warmup_runs": 1,
+  "num_measurement_runs": 2,
+  "avg_generation_time_s": 226.125,
+  "individual_times_s": [
+    227.275,
+    224.974
+  ],
+  "throughput_fps": 0.341,
+  "max_peak_memory_mb": 20664.4,
+  "individual_peak_memories_mb": [
+    20662.4,
+    20664.4
+  ],
+  "avg_stage_times_s": {
+    "DecodingStage": 19.2288,
+    "DenoisingStage": 201.7776,
+    "TextEncodingStage": 3.5986,
+    "LatentPreparationStage": 0.0188,
+    "InputValidationStage": 0.0,
+    "TimestepPreparationStage": 0.0003,
+    "ConditioningStage": 0.0
+  },
+  "per_run_stage_times_s": [
+    {
+      "InputValidationStage": 4.0949999970507633e-05,
+      "TextEncodingStage": 3.5984224189999736,
+      "ConditioningStage": 3.055000001950248e-05,
+      "TimestepPreparationStage": 0.0003410539999890716,
+      "LatentPreparationStage": 0.019170242999962284,
+      "DenoisingStage": 202.85533846299995,
+      "DecodingStage": 19.24779579599999
+    },
+    {
+      "InputValidationStage": 3.472100001999934e-05,
+      "TextEncodingStage": 3.59874864599999,
+      "ConditioningStage": 2.6759999968817283e-05,
+      "TimestepPreparationStage": 0.0003001150000727648,
+      "LatentPreparationStage": 0.0185082059999786,
+      "DenoisingStage": 200.69984791399997,
+      "DecodingStage": 19.209854054999937
+    }
+  ],
+  "thresholds": {
+    "max_generation_time_s": 600.0,
+    "max_peak_memory_mb": 40000.0
+  },
+  "commit": "",
+  "pr_number": "",
+  "timestamp": "2026-05-12T15:41:27.695364+00:00"
+}
