@@ -504,8 +504,14 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
                 rhos_p = torch.tensor([0.5], dtype=x.dtype, device=device)
             else:
                 assert isinstance(R, torch.Tensor)
-                rhos_p = torch.linalg.solve(R[:-1, :-1],
-                                            b[:-1]).to(device).to(x.dtype)
+                # torch.linalg.solve unconditionally runs at::_linalg_check_errors
+                # post-solve, which reads the cuSOLVER info tensor via
+                # .item<bool>() — a host-GPU sync that drains the launch
+                # pipeline per step. solve_ex with check_errors=False uses the
+                # same cuSOLVER kernel but skips the sync, giving bit-identical
+                # output without the host stall.
+                rhos_p = torch.linalg.solve_ex(R[:-1, :-1], b[:-1],
+                                               check_errors=False)[0].to(x.dtype)
         else:
             D1s = None
 
@@ -644,7 +650,10 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
         if order == 1:
             rhos_c = torch.tensor([0.5], dtype=x.dtype, device=device)
         else:
-            rhos_c = torch.linalg.solve(R, b).to(device).to(x.dtype)
+            # See predictor branch for rationale: solve_ex(check_errors=False)
+            # keeps the cuSOLVER path (bit-identical output) and avoids the
+            # mandatory linalg-check host sync per step.
+            rhos_c = torch.linalg.solve_ex(R, b, check_errors=False)[0].to(x.dtype)
 
         if self.predict_x0:
             x_t_ = sigma_t / sigma_s0 * x - alpha_t * h_phi_1 * m0
