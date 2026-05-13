@@ -11,6 +11,7 @@ from typing import Any
 import torch
 from tqdm.auto import tqdm
 
+import fastvideo.envs as envs
 from fastvideo.attention import get_attn_backend
 from fastvideo.distributed import (get_local_torch_device, get_world_group)
 from fastvideo.fastvideo_args import FastVideoArgs
@@ -115,7 +116,8 @@ class DenoisingStage(PipelineStage):
         # Prepare image latents and embeddings for I2V generation
         image_embeds = batch.image_embeds
         if len(image_embeds) > 0:
-            assert not torch.isnan(image_embeds[0]).any(), "image_embeds contains nan"
+            if envs.FASTVIDEO_DEBUG_NAN_CHECK:
+                assert not torch.isnan(image_embeds[0]).any(), "image_embeds contains nan"
             image_embeds = [image_embed.to(target_dtype) for image_embed in image_embeds]
 
         image_kwargs = self.prepare_extra_func_kwargs(
@@ -161,11 +163,13 @@ class DenoisingStage(PipelineStage):
         # Get latents and embeddings
         latents = batch.latents
         prompt_embeds = batch.prompt_embeds
-        assert not torch.isnan(prompt_embeds[0]).any(), "prompt_embeds contains nan"
+        if envs.FASTVIDEO_DEBUG_NAN_CHECK:
+            assert not torch.isnan(prompt_embeds[0]).any(), "prompt_embeds contains nan"
         if batch.do_classifier_free_guidance:
             neg_prompt_embeds = batch.negative_prompt_embeds
             assert neg_prompt_embeds is not None
-            assert not torch.isnan(neg_prompt_embeds[0]).any(), "neg_prompt_embeds contains nan"
+            if envs.FASTVIDEO_DEBUG_NAN_CHECK:
+                assert not torch.isnan(neg_prompt_embeds[0]).any(), "neg_prompt_embeds contains nan"
 
         # (Wan2.2) Calculate timestep to switch from high noise expert to low noise expert
         boundary_ratio = fastvideo_args.pipeline_config.dit_config.boundary_ratio
@@ -271,7 +275,8 @@ class DenoisingStage(PipelineStage):
                     assert not fastvideo_args.pipeline_config.ti2v_task, "image latents should not be provided for TI2V task"
                     latent_model_input = torch.cat([latent_model_input, batch.image_latent], dim=1).to(target_dtype)
 
-                assert not torch.isnan(latent_model_input).any(), "latent_model_input contains nan"
+                if envs.FASTVIDEO_DEBUG_NAN_CHECK:
+                    assert not torch.isnan(latent_model_input).any(), "latent_model_input contains nan"
                 if fastvideo_args.pipeline_config.ti2v_task and batch.pil_image is not None:
                     timestep = torch.stack([t]).to(get_local_torch_device())
                     temp_ts = (mask2[0][0][:, ::2, ::2] * timestep).flatten()
@@ -1071,7 +1076,8 @@ class DmdDenoisingStage(DenoisingStage):
         # Prepare image latents and embeddings for I2V generation
         image_embeds = batch.image_embeds
         if len(image_embeds) > 0:
-            assert torch.isnan(image_embeds[0]).sum() == 0
+            if envs.FASTVIDEO_DEBUG_NAN_CHECK:
+                assert torch.isnan(image_embeds[0]).sum() == 0
             image_embeds = [image_embed.to(target_dtype) for image_embed in image_embeds]
 
         image_kwargs = self.prepare_extra_func_kwargs(
@@ -1096,7 +1102,8 @@ class DmdDenoisingStage(DenoisingStage):
 
         video_raw_latent_shape = latents.shape
         prompt_embeds = batch.prompt_embeds
-        assert not torch.isnan(prompt_embeds[0]).any(), "prompt_embeds contains nan"
+        if envs.FASTVIDEO_DEBUG_NAN_CHECK:
+            assert not torch.isnan(prompt_embeds[0]).any(), "prompt_embeds contains nan"
         timesteps = torch.tensor(fastvideo_args.pipeline_config.dmd_denoising_steps,
                                  dtype=torch.long,
                                  device=get_local_torch_device())
@@ -1114,7 +1121,8 @@ class DmdDenoisingStage(DenoisingStage):
                 if batch.image_latent is not None:
                     latent_model_input = torch.cat(
                         [latent_model_input, batch.image_latent.permute(0, 2, 1, 3, 4)], dim=2).to(target_dtype)
-                assert not torch.isnan(latent_model_input).any(), "latent_model_input contains nan"
+                if envs.FASTVIDEO_DEBUG_NAN_CHECK:
+                    assert not torch.isnan(latent_model_input).any(), "latent_model_input contains nan"
 
                 # Prepare inputs for transformer
                 t_expand = t.repeat(latent_model_input.shape[0])
