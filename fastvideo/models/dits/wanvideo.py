@@ -611,6 +611,11 @@ class WanTransformer3DModel(BaseDiT):
             torch.randn(1, 2, inner_dim) / inner_dim**0.5)
 
         self.gradient_checkpointing = False
+        # Cache rotary embeddings across denoising steps. Key on spatial shape
+        # (post_patch_F, H, W); all other inputs to get_rotary_pos_embed are
+        # constant per process (hidden_size, num_heads, dim_list, rope_theta).
+        # Plain dict — NOT a registered buffer to avoid contaminating state_dict.
+        self._freqs_cis_cache: dict = {}
         self.__post_init__()
 
     def forward(self,
@@ -636,19 +641,23 @@ class WanTransformer3DModel(BaseDiT):
         post_patch_height = height // p_h
         post_patch_width = width // p_w
 
-        # Get rotary embeddings
-        d = self.hidden_size // self.num_attention_heads
-        rope_dim_list = [d - 4 * (d // 6), 2 * (d // 6), 2 * (d // 6)]
-        freqs_cos, freqs_sin = get_rotary_pos_embed(
-            (post_patch_num_frames, post_patch_height,
-             post_patch_width),
-            self.hidden_size,
-            self.num_attention_heads,
-            rope_dim_list,
-            dtype=torch.float32 if current_platform.is_mps() else torch.float64,
-            rope_theta=10000)
-        freqs_cis = (freqs_cos.to(hidden_states.device).float(),
-                     freqs_sin.to(hidden_states.device).float())
+        # Get rotary embeddings (cached across denoising steps — spatial shape
+        # is the only input that could vary, and it's constant per generation).
+        cache_key = (post_patch_num_frames, post_patch_height, post_patch_width)
+        freqs_cis = self._freqs_cis_cache.get(cache_key)
+        if freqs_cis is None:
+            d = self.hidden_size // self.num_attention_heads
+            rope_dim_list = [d - 4 * (d // 6), 2 * (d // 6), 2 * (d // 6)]
+            freqs_cos, freqs_sin = get_rotary_pos_embed(
+                cache_key,
+                self.hidden_size,
+                self.num_attention_heads,
+                rope_dim_list,
+                dtype=torch.float32 if current_platform.is_mps() else torch.float64,
+                rope_theta=10000)
+            freqs_cis = (freqs_cos.to(hidden_states.device).float(),
+                         freqs_sin.to(hidden_states.device).float())
+            self._freqs_cis_cache[cache_key] = freqs_cis
 
         hidden_states = self.patch_embedding(hidden_states)
         hidden_states = hidden_states.flatten(2).transpose(1, 2)

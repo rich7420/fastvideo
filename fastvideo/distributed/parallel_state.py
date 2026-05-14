@@ -48,11 +48,6 @@ from fastvideo.logger import init_logger
 logger = init_logger(__name__)
 
 
-@dataclass
-class GraphCaptureContext:
-    stream: torch.cuda.Stream | None
-
-
 TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 
 
@@ -253,33 +248,6 @@ class GroupCoordinator:
         rank_in_group = self.rank_in_group
         world_size = self.world_size
         return self.ranks[(rank_in_group - 1) % world_size]
-
-    @contextmanager
-    def graph_capture(self, graph_capture_context: GraphCaptureContext | None = None):
-        # Platform-aware graph capture
-        from fastvideo.platforms import current_platform
-
-        if current_platform.is_cuda_alike():
-            if graph_capture_context is None:
-                stream = torch.cuda.Stream()
-                graph_capture_context = GraphCaptureContext(stream)
-            else:
-                stream = graph_capture_context.stream
-
-            # ensure all initialization operations complete before attempting to
-            # capture the graph on another stream
-            curr_stream = torch.cuda.current_stream()
-            if curr_stream != stream:
-                stream.wait_stream(curr_stream)
-
-            with torch.cuda.stream(stream):
-                yield graph_capture_context
-        else:
-            # For non-CUDA platforms (MPS, CPU), just yield the context without stream management
-            if graph_capture_context is None:
-                # Create a dummy context for non-CUDA platforms
-                graph_capture_context = GraphCaptureContext(None)
-            yield graph_capture_context
 
     def all_reduce(self, input_: torch.Tensor, op: torch.distributed.ReduceOp | None = ReduceOp.SUM) -> torch.Tensor:
         """
@@ -711,12 +679,22 @@ def get_tp_group() -> GroupCoordinator:
     return _TP
 
 
-_ENABLE_CUSTOM_ALL_REDUCE = True
+def _apply_nccl_defaults() -> None:
+    """Set NCCL defaults tuned for sequence-parallel video diffusion.
 
-
-def set_custom_all_reduce(enable: bool):
-    global _ENABLE_CUSTOM_ALL_REDUCE
-    _ENABLE_CUSTOM_ALL_REDUCE = enable
+    Wan-class workloads issue ~100-200 MB all-to-all collectives many times per
+    step. On PCIe-only multi-GPU hosts (no NVLink), the default 4 MB NCCL
+    buffer fragments each collective into many small chunks, leaving the link
+    under-utilized. These defaults only take effect when the corresponding env
+    var is NOT already set, so users keep full override control.
+    """
+    # Larger buffer → fewer chunks per a2a → less per-chunk overhead on
+    # bandwidth-bound PCIe paths. 8 MB is the sweet spot we observed on 4× L40S
+    # without NVLink; users on NVLink/NVSwitch can leave it default.
+    os.environ.setdefault("NCCL_BUFFSIZE", "8388608")  # 8 MiB (default 4 MiB)
+    # Simple protocol avoids the LL/LL128 latency tradeoff that only pays off
+    # for very small (<1 MiB) messages; our collectives are 100+ MB.
+    os.environ.setdefault("NCCL_PROTO", "Simple")
 
 
 def init_distributed_environment(
@@ -725,13 +703,13 @@ def init_distributed_environment(
     distributed_init_method: str = "env://",
     local_rank: int = 0,
     backend: str = "nccl",
-    device_id: torch.device | None = None,
 ):
     # Determine the appropriate backend based on the platform
     from fastvideo.platforms import current_platform
     backend = "nccl"
     if current_platform.is_cuda_alike():
         logger.info("Using nccl backend for CUDA platform")
+        _apply_nccl_defaults()
     elif current_platform.is_npu():
         backend = "hccl"
         logger.info("Using hccl backend for NPU platform")
@@ -911,8 +889,7 @@ def maybe_init_distributed_environment_and_model_parallel(tp_size: int,
     init_distributed_environment(world_size=world_size,
                                  rank=rank,
                                  local_rank=local_rank,
-                                 distributed_init_method=distributed_init_method,
-                                 device_id=device)
+                                 distributed_init_method=distributed_init_method)
     initialize_model_parallel(tensor_model_parallel_size=tp_size, sequence_model_parallel_size=sp_size)
 
     # set device if we're on a CUDA/NPU platform

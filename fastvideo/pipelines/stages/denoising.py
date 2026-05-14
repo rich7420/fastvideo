@@ -233,6 +233,18 @@ class DenoisingStage(PipelineStage):
         # written to, so we allocate once.
         v2v_zero_pad = torch.zeros_like(latents) if batch.video_latent is not None else None
 
+        # Pin the scheduler step index to 0 so the first scheduler.step call
+        # doesn't fall into the index_for_timestep lookup (which does an
+        # .item() → host sync). T2V/I2V inference always starts at the first
+        # timestep of the schedule, so this is bit-exact.
+        if hasattr(self.scheduler, "set_begin_index"):
+            self.scheduler.set_begin_index(0)
+
+        # Pre-resolve whether transformer.forward accepts `timestep_r` so we
+        # don't run inspect.signature() inside the denoising loop.
+        _accepts_timestep_r = "timestep_r" in inspect.signature(self.transformer.forward).parameters
+        _default_timesteps_r_kwarg: dict[str, Any] = ({"timestep_r": None} if _accepts_timestep_r else {})
+
         # Run denoising loop
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
@@ -293,15 +305,12 @@ class DenoisingStage(PipelineStage):
                     else:
                         timesteps_r = timesteps[i + 1]
                     timesteps_r = timesteps_r.repeat(latent_model_input.shape[0])
+                    timesteps_r_kwarg = ({"timestep_r": timesteps_r}
+                                         if _accepts_timestep_r else {})
                 else:
-                    timesteps_r = None
-
-                timesteps_r_kwarg = self.prepare_extra_func_kwargs(
-                    self.transformer.forward,
-                    {
-                        "timestep_r": timesteps_r,
-                    },
-                )
+                    # Non-meanflow path: timesteps_r is always None across the
+                    # whole loop, so the kwargs dict was already determined.
+                    timesteps_r_kwarg = _default_timesteps_r_kwarg
 
                 latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
