@@ -74,13 +74,19 @@ _IGNORE = [
     "**/node_modules/**",
     # Profile / benchmark artifacts that pile up in repo root
     "*.nsys-rep",
+    "**/*.nsys-rep",
     "*.sqlite",
+    "**/*.sqlite",
     "*.nsys-cache/**",
+    "**/*.nsys-cache/**",
     "*.qdstrm",
+    "**/*.qdstrm",
     "nsys_results/**",
+    "profile_results/**",
     "fastvideo/tests/performance/results/**",
     "fastvideo/tests/performance/generated_videos/**",
     ".parquet_build_*/**",
+    "**/.parquet_build_*/**",
     # Pre-existing builds we don't want to overwrite the image's kernel with
     "fastvideo-kernel/build/**",
     "fastvideo-kernel/_skbuild/**",
@@ -144,16 +150,38 @@ def run_perf_nsys(benchmark_id: str = "wan-t2v-1.3b-l40s-hires") -> int:
     # pytest 8 + anyio bug where rewrite.find_spec gets a non-string path
     # ("'AssertionRewritingHook' object has no attribute 'rpartition'").
     # Our threshold asserts work fine without rewriting.
+    # Exact-match by surrounding with square brackets so substring-overlap
+    # configs (e.g. wan-t2v-1.3b-l40s-compile-sp1) don't get pulled in.
     pytest_cmd = (
         f"pytest -vs --assert=plain "
         f"./fastvideo/tests/performance/test_inference_performance.py "
-        f"-k {benchmark_id}")
+        f"-k \"[{benchmark_id}]\"")
+    # NCCL diagnostic env vars (override-able via PERF_NCCL_* local env vars
+    # for sweeping algo/proto without redeploying).
+    nccl_debug = os.environ.get("PERF_NCCL_DEBUG", "INFO")  # default: log algo selection
+    nccl_algo = os.environ.get("PERF_NCCL_ALGO", "")  # "" = NCCL auto
+    nccl_proto = os.environ.get("PERF_NCCL_PROTO", "")
+    nccl_buffsize = os.environ.get("PERF_NCCL_BUFFSIZE", "")
+    nccl_exports = (
+        f"export NCCL_DEBUG={nccl_debug} ; "
+        + (f"export NCCL_ALGO={nccl_algo} ; " if nccl_algo else "")
+        + (f"export NCCL_PROTO={nccl_proto} ; " if nccl_proto else "")
+        + (f"export NCCL_BUFFSIZE={nccl_buffsize} ; " if nccl_buffsize else "")
+    )
+
     command = (
         "set +e && "
         "source /opt/venv/bin/activate && "
         "cd /FastVideo && "
         # HF login if a token was provided (gated models).
         '( [ -z "${HF_API_KEY:-}" ] || hf auth login --token "$HF_API_KEY" --quiet || true ) && '
+        # Dump GPU topology + driver info so NCCL behaviour can be reproduced.
+        "echo '=== nvidia-smi topo -m ===' ; nvidia-smi topo -m 2>&1 || true ; "
+        "echo '=== nvidia-smi --query-gpu=name,driver_version,pcie.link.gen.current,pcie.link.width.current --format=csv ===' ; "
+        "nvidia-smi --query-gpu=name,driver_version,pcie.link.gen.current,pcie.link.width.current --format=csv 2>&1 || true ; "
+        # NCCL env (logged + overridable).
+        + nccl_exports +
+        "echo '=== NCCL env ===' ; env | grep NCCL_ 2>&1 || true ; "
         # QuadD UUID workaround.
         "NSYS_CFG=$(nsys -z 2>/dev/null || true) && "
         "if [ -n \"$NSYS_CFG\" ]; then "
@@ -167,6 +195,7 @@ def run_perf_nsys(benchmark_id: str = "wan-t2v-1.3b-l40s-hires") -> int:
         "  --pytorch=autograd-nvtx "
         "  --cpuctxsw=none "
         "  --sample=none "
+        "  --cuda-memory-usage=false "
         "  --stats=false "
         f" -- bash -c '{pytest_cmd}' ; "
         "PYTEST_RC=$? ; "
@@ -176,6 +205,10 @@ def run_perf_nsys(benchmark_id: str = "wan-t2v-1.3b-l40s-hires") -> int:
         "mkdir -p /results/perf_json && "
         "find ./fastvideo/tests/performance/results -name 'perf_*.json' "
         "  -exec cp -v {} /results/perf_json/ \\; 2>&1 || true ; "
+        # Copy generated videos for downstream SSIM regression.
+        "mkdir -p /results/perf_videos && "
+        "find ./fastvideo/tests/performance/generated_videos -name '*.mp4' "
+        "  -exec cp -v {} /results/perf_videos/ \\; 2>&1 || true ; "
         "exit $PYTEST_RC")
 
     result = subprocess.run(
@@ -231,10 +264,11 @@ def run_perf_nsys_sp2(benchmark_id: str = "wan-t2v-1.3b-l40s-hires-sp2") -> int:
         "FASTVIDEO_STAGE_LOGGING": "1",
         "HF_HOME": "/root/data/.cache",
     }
+    # Exact-match via bracket so we don't accidentally pull in compile-sp1.
     pytest_cmd = (
         f"pytest -vs --assert=plain "
         f"./fastvideo/tests/performance/test_inference_performance.py "
-        f"-k {benchmark_id}")
+        f"-k \"[{benchmark_id}]\"")
     command = (
         "set +e && "
         "source /opt/venv/bin/activate && "
@@ -252,6 +286,7 @@ def run_perf_nsys_sp2(benchmark_id: str = "wan-t2v-1.3b-l40s-hires-sp2") -> int:
         "  --pytorch=autograd-nvtx "
         "  --cpuctxsw=none "
         "  --sample=none "
+        "  --cuda-memory-usage=false "
         "  --stats=false "
         f" -- bash -c '{pytest_cmd}' ; "
         "PYTEST_RC=$? ; "
@@ -282,11 +317,88 @@ def run_perf_nsys_sp2(benchmark_id: str = "wan-t2v-1.3b-l40s-hires-sp2") -> int:
     return int(result.returncode)
 
 
+@app.function(
+    gpu="L40S:1",
+    image=image,
+    timeout=3600,
+    memory=65536,
+    secrets=[modal.Secret.from_dict({"HF_API_KEY": os.environ.get("HF_API_KEY", "")})],
+    volumes={"/root/data": model_vol, "/results": results_vol},
+)
+def run_perf_nsys_sp1(benchmark_id: str = "wan-t2v-1.3b-l40s-compile-sp1") -> int:
+    # Single-GPU oracle: no NCCL at all. Used to calibrate the true cost of SP
+    # all_to_all in the sp=4 baseline.
+    print(f"[perf-nsys-sp1] benchmark_id={benchmark_id}")
+
+    profile_env = {
+        **os.environ,
+        "PYTHONUNBUFFERED": "1",
+        "FASTVIDEO_STAGE_LOGGING": "1",
+        "HF_HOME": "/root/data/.cache",
+    }
+    pytest_cmd = (
+        f"pytest -vs --assert=plain "
+        f"./fastvideo/tests/performance/test_inference_performance.py "
+        f"-k \"[{benchmark_id}]\"")
+    command = (
+        "set +e && "
+        "source /opt/venv/bin/activate && "
+        "cd /FastVideo && "
+        '( [ -z "${HF_API_KEY:-}" ] || hf auth login --token "$HF_API_KEY" --quiet || true ) && '
+        "NSYS_CFG=$(nsys -z 2>/dev/null || true) && "
+        "if [ -n \"$NSYS_CFG\" ]; then "
+        "  mkdir -p \"$(dirname \"$NSYS_CFG\")\" && "
+        "  echo 'CuptiUseRawGpuTimestamps=false' >> \"$NSYS_CFG\"; "
+        "fi && "
+        "nsys profile "
+        "  --force-overwrite=true "
+        "  -o /tmp/perf_sp1 "
+        "  --trace=cuda,nvtx "
+        "  --pytorch=autograd-nvtx "
+        "  --cpuctxsw=none "
+        "  --sample=none "
+        "  --cuda-memory-usage=false "
+        "  --stats=false "
+        f" -- bash -c '{pytest_cmd}' ; "
+        "PYTEST_RC=$? ; "
+        "cp -v /tmp/perf_sp1.nsys-rep /results/perf_sp1.nsys-rep 2>&1 || true ; "
+        "mkdir -p /results/perf_json && "
+        "find ./fastvideo/tests/performance/results -name 'perf_*.json' "
+        "  -exec cp -v {} /results/perf_json/ \\; 2>&1 || true ; "
+        "exit $PYTEST_RC")
+
+    result = subprocess.run(
+        ["/bin/bash", "-c", command],
+        env=profile_env,
+        stdout=sys.stdout,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    stderr_text = (result.stderr or b"").decode(errors="replace")
+    if stderr_text:
+        sys.stderr.write(stderr_text)
+
+    try:
+        results_vol.commit()
+    except Exception as exc:
+        print(f"[perf-nsys-sp1] volume commit failed: {exc}", file=sys.stderr)
+
+    has_nsys = os.path.isfile("/results/perf_sp1.nsys-rep")
+    print(f"\n[perf-nsys-sp1] === Outcome === pytest={result.returncode}, nsys={'OK' if has_nsys else 'MISSING'}")
+    return int(result.returncode)
+
+
 @app.local_entrypoint()
 def main() -> None:
-    # PERF_GPU_COUNT=2 selects the sp=2 path; defaults to the original 4x L40S run.
+    # PERF_GPU_COUNT=1 selects sp=1 (single-GPU oracle), =2 selects sp=2 (2 ranks),
+    # otherwise defaults to the 4x L40S sp=4 run.
     gpu_count = int(os.environ.get("PERF_GPU_COUNT", "4"))
-    if gpu_count == 2:
+    if gpu_count == 1:
+        benchmark_id = os.environ.get("PERF_BENCHMARK_ID", "wan-t2v-1.3b-l40s-compile-sp1")
+        print(f"[local] gpu_count=1, benchmark_id={benchmark_id}")
+        print(f"[local] uploading source from: {LOCAL_ROOT}")
+        exit_code = run_perf_nsys_sp1.remote(benchmark_id=benchmark_id)
+    elif gpu_count == 2:
         benchmark_id = os.environ.get("PERF_BENCHMARK_ID", "wan-t2v-1.3b-l40s-hires-sp2")
         print(f"[local] gpu_count=2, benchmark_id={benchmark_id}")
         print(f"[local] uploading source from: {LOCAL_ROOT}")
