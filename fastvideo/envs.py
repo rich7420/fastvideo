@@ -43,6 +43,7 @@ if TYPE_CHECKING:
     FASTVIDEO_SERVER_DEV_MODE: bool = False
     FASTVIDEO_STAGE_LOGGING: bool = False
     FASTVIDEO_DEBUG_NAN_CHECK: bool = False
+    FASTVIDEO_TGATE_STEP: float = 1.0
     FASTVIDEO_HOST_IP: str = ""
     FASTVIDEO_LOOPBACK_IP: str = ""
 
@@ -291,6 +292,31 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # observed on 4x L40S Wan T2V). Enable when chasing numerical bugs.
     "FASTVIDEO_DEBUG_NAN_CHECK":
     lambda: bool(int(os.getenv("FASTVIDEO_DEBUG_NAN_CHECK", "0"))),
+
+    # TGATE / stale-uncond-reuse fraction for CFG.  Float in [0, 1].
+    # Interpretation: for step index `i < num_inference_steps * X`, run both
+    # cond and uncond forwards and refresh delta_cached = cond - uncond.
+    # Once `i >= num_inference_steps * X`, skip the uncond forward and reuse
+    # the cached delta:  noise_pred = cond + (guidance_scale - 1) * delta.
+    #
+    # Edge cases:
+    #   1.0 (default) : disables gating; identical to baseline two-pass CFG.
+    #   0.5           : run uncond for the first half of steps, reuse delta
+    #                    for the second half (~25% inference time saved on
+    #                    bandwidth-bound SP setups).
+    #   0.0           : step 0 still computes uncond fresh (cache is empty
+    #                    at start) — all subsequent steps reuse the step-0
+    #                    delta.  This is the most aggressive setting; does
+    #                    NOT mean "no uncond forward ever."
+    #
+    # Caveats:
+    #   - Algorithmically approximate; not bit-exact vs baseline CFG.
+    #     Validate per-pipeline with SSIM / VBench before lowering below 1.0.
+    #   - Interaction with `guidance_rescale > 0` is unvalidated; the
+    #     denoising stage logs a warning when both are active.
+    #   - Wan2.2 high/low-noise expert switch invalidates the cache.
+    "FASTVIDEO_TGATE_STEP":
+    lambda: float(os.getenv("FASTVIDEO_TGATE_STEP", "1.0")),
 }
 
 # end-env-vars-definition

@@ -127,7 +127,10 @@ image = (
     image=image,
     timeout=3600,
     memory=65536,
-    secrets=[modal.Secret.from_dict({"HF_API_KEY": os.environ.get("HF_API_KEY", "")})],
+    secrets=[modal.Secret.from_dict({
+        "HF_API_KEY": os.environ.get("HF_API_KEY", ""),
+        "FASTVIDEO_TGATE_STEP": os.environ.get("FASTVIDEO_TGATE_STEP", "1.0"),
+    })],
     volumes={"/root/data": model_vol, "/results": results_vol},
 )
 def run_perf_nsys(benchmark_id: str = "wan-t2v-1.3b-l40s-hires") -> int:
@@ -249,7 +252,10 @@ def run_perf_nsys(benchmark_id: str = "wan-t2v-1.3b-l40s-hires") -> int:
     image=image,
     timeout=3600,
     memory=65536,
-    secrets=[modal.Secret.from_dict({"HF_API_KEY": os.environ.get("HF_API_KEY", "")})],
+    secrets=[modal.Secret.from_dict({
+        "HF_API_KEY": os.environ.get("HF_API_KEY", ""),
+        "FASTVIDEO_TGATE_STEP": os.environ.get("FASTVIDEO_TGATE_STEP", "1.0"),
+    })],
     volumes={"/root/data": model_vol, "/results": results_vol},
 )
 def run_perf_nsys_sp2(benchmark_id: str = "wan-t2v-1.3b-l40s-hires-sp2") -> int:
@@ -322,7 +328,10 @@ def run_perf_nsys_sp2(benchmark_id: str = "wan-t2v-1.3b-l40s-hires-sp2") -> int:
     image=image,
     timeout=3600,
     memory=65536,
-    secrets=[modal.Secret.from_dict({"HF_API_KEY": os.environ.get("HF_API_KEY", "")})],
+    secrets=[modal.Secret.from_dict({
+        "HF_API_KEY": os.environ.get("HF_API_KEY", ""),
+        "FASTVIDEO_TGATE_STEP": os.environ.get("FASTVIDEO_TGATE_STEP", "1.0"),
+    })],
     volumes={"/root/data": model_vol, "/results": results_vol},
 )
 def run_perf_nsys_sp1(benchmark_id: str = "wan-t2v-1.3b-l40s-compile-sp1") -> int:
