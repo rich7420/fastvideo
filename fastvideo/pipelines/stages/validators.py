@@ -11,6 +11,24 @@ from typing import Any
 
 import torch
 
+import fastvideo.envs as envs
+
+
+def _tensor_has_no_nan(value: torch.Tensor) -> bool:
+    """NaN check that costs a host sync per call.
+
+    Returns True (i.e. "no NaN") in production unless FASTVIDEO_DEBUG_NAN_CHECK
+    is set. The validators here are invoked from every stage's verify_input /
+    verify_output on full activation tensors (e.g. latents, embeds); each call
+    to `.item()` forces cudaStreamSynchronize and waits for prior NCCL /
+    compute to drain. Gating the check keeps verification's structural
+    guarantees (dtype/shape/dim) free of GPU sync while preserving an opt-in
+    path for NaN-hunting workflows.
+    """
+    if not envs.FASTVIDEO_DEBUG_NAN_CHECK:
+        return True
+    return not torch.isnan(value).any().item()
+
 
 class StageValidators:
     """Common validators for pipeline stages."""
@@ -50,7 +68,7 @@ class StageValidators:
         """Check if value is a torch tensor and doesn't contain NaN values."""
         if not isinstance(value, torch.Tensor):
             return False
-        return not torch.isnan(value).any().item()
+        return _tensor_has_no_nan(value)
 
     @staticmethod
     def tensor_with_dims(value: Any, dims: int) -> bool:
@@ -59,7 +77,7 @@ class StageValidators:
             return False
         if value.dim() != dims:
             return False
-        return not torch.isnan(value).any().item()
+        return _tensor_has_no_nan(value)
 
     @staticmethod
     def tensor_min_dims(value: Any, min_dims: int) -> bool:
@@ -68,7 +86,7 @@ class StageValidators:
             return False
         if value.dim() < min_dims:
             return False
-        return not torch.isnan(value).any().item()
+        return _tensor_has_no_nan(value)
 
     @staticmethod
     def tensor_shape_matches(value: Any, expected_shape: tuple) -> bool:
@@ -80,7 +98,7 @@ class StageValidators:
         for actual, expected in zip(value.shape, expected_shape, strict=True):
             if expected is not None and actual != expected:
                 return False
-        return not torch.isnan(value).any().item()
+        return _tensor_has_no_nan(value)
 
     @staticmethod
     def list_not_empty(value: Any) -> bool:
@@ -142,7 +160,7 @@ class StageValidators:
             return True
         if not isinstance(value, torch.Tensor):
             return False
-        return not torch.isnan(value).any().item()
+        return _tensor_has_no_nan(value)
 
     @staticmethod
     def list_of_tensors_with_dims(value: Any, dims: int) -> bool:
@@ -154,7 +172,7 @@ class StageValidators:
                 return False
             if item.dim() != dims:
                 return False
-            if torch.isnan(item).any().item():
+            if not _tensor_has_no_nan(item):
                 return False
         return True
 
@@ -166,7 +184,7 @@ class StageValidators:
         for item in value:
             if not isinstance(item, torch.Tensor):
                 return False
-            if torch.isnan(item).any().item():
+            if not _tensor_has_no_nan(item):
                 return False
         return True
 
@@ -180,7 +198,7 @@ class StageValidators:
                 return False
             if item.dim() < min_dims:
                 return False
-            if torch.isnan(item).any().item():
+            if not _tensor_has_no_nan(item):
                 return False
         return True
 
@@ -195,7 +213,7 @@ class StageValidators:
                 return False
             if value.dim() != dims:
                 return False
-            return not torch.isnan(value).any().item()
+            return _tensor_has_no_nan(value)
 
         return validator
 

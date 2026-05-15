@@ -990,8 +990,10 @@ class Cosmos25DenoisingStage(CosmosDenoisingStage):
                     if cond_indicator is not None and t_frames > 0:
                         cond_t = cond_indicator[0, 0, :t_frames, 0, 0]
                         cond_mask_t = (cond_t > 0.5)
-                        if bool(cond_mask_t.any().item()):
-                            timestep[0, cond_mask_t] = float(conditional_frame_timestep)
+                        # Always apply masked write; with an all-False mask
+                        # this is a GPU no-op. Skipping the `.any().item()`
+                        # guard avoids a host sync per denoising step.
+                        timestep[0, cond_mask_t] = float(conditional_frame_timestep)
                 else:
                     timestep_val = t_val * timestep_scale
                     timestep = torch.tensor(
