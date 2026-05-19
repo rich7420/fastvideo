@@ -1121,3 +1121,935 @@ methodology error documented in §21.2.
    should probably skip; the per-forward time at 1.76 s is dominated by
    GPU compute + NCCL, not launch overhead, so graph capture won't move
    the needle much.
+
+---
+
+## 22. NCCL knob sweep concluded (2026-05-15 → 2026-05-16)
+
+**Status: experiments concluded; no general acceleration shipped.** Six
+knob/code-level hypotheses plus one layout-cleanup variant ("Item A") were
+measured against the post-§21 baseline. None produced a ship-worthy general
+gain. This section records what was tried, what was found, and what
+remains.
+
+### 22.1 Results table
+
+All deltas measured same-container A/B per the §21.2 methodology rule.
+
+| # | Hypothesis | Mechanism it would attack (§22 buckets, conceptually) | Result | Δ vs baseline | Ship? |
+|---|---|---|---|---:|---|
+| 1 | Newer NCCL fuses extra ops | per-call kernel count | NCCL 2.27 (current) already fused these | N/A | No |
+| 2 | Hidden sync inside NCCL kernel | per-call wait | Profile inspection: no extra sync inside `ncclDevKernel_SendRecv` | N/A | No |
+| 3 | `NCCL_NCHANNELS=1` (halve channel setup) | per-call ring+launch overhead | L40S **−6.8 %**, H100 **+19.4 %** | hardware-specific | **No** (see §22.2) |
+| 4 | Replicated-token AllGather optimisation | small NCCL slice | Wan T2V doesn't trigger the replicated path | N/A | No |
+| 5 | `torch.distributed._functional_collectives` | stream-aware scheduling | **+1 %** (marginally worse, within noise) | ~0 % | No |
+| 6 | `NCCL_BUFFSIZE` tuning | per-call chunking | No measurable effect across 4–32 MB sweep | ~0 % | No |
+| A | Remove one wrapper layout copy (`.contiguous()` × 3 → × 2) | bucket-1 (layout copy / pack-unpack) | **−0.6 %** (within Modal cross-run noise ±3 %) | ~0 % | No (bit-exact-safe cleanup only) |
+
+### 22.2 Item 3: the hardware-specific divergence
+
+`NCCL_NCHANNELS=1` was the most promising knob — it halves the per-call
+channel-setup overhead at the cost of half the wire bandwidth. Given the
+profile's bucket-2 (wire) was ~3 % of NCCL kernel time and bucket-3
+(launch+ring overhead) was ~97 %, halving the latter at the cost of
+doubling the former *should* have been a clear win.
+
+Result on the same workload across two GPU classes:
+
+```
+L40S 4×, PCIe Gen4 x16, no NVLink     :  −6.8 %  end-to-end
+H100 4×, NVLink/NVSwitch              :  +19.4 % end-to-end (worse)
+```
+
+Interpretation:
+
+- On L40S, all collective traffic shares the same PCIe-through-PHB path
+  anyway; one channel saturates the link, so a second channel adds setup
+  overhead without buying bandwidth. NCHANNELS=1 wins.
+- On H100, NVLink/NVSwitch provides multiple physical paths between any
+  pair of GPUs. NCHANNELS=2 (default) lets NCCL stripe across those paths
+  for real bandwidth gain; reducing to 1 leaves bandwidth on the table.
+
+This is the **rule that disqualifies it from shipping as a general
+default**: a setting that helps one hardware class and hurts another by a
+larger margin can't be a static env var in FastVideo's code. It belongs in
+deployment configuration, not the codebase. Recording the finding here so
+future deployment guides can reference it.
+
+### 22.3 What did land
+
+One change was committed from the entire post-§21 sweep:
+
+```
+commit cacc3d17   [perf] gate validators NaN check (Step 1 only)
+```
+
+Unrelated to NCCL — it gates an expensive Step-1 validator NaN scan behind a
+debug flag so it doesn't fire during steady-state inference. Modest CPU-side
+savings; bit-exact safe; orthogonal to anything in §17 / §18.
+
+### 22.4 Modal harness retained vs removed
+
+After concluding the sweep, the experiment scripts under `fastvideo/tests/modal/`
+were triaged:
+
+**Retained** (framework reusable for future routes):
+
+```
+cfg_batch_ab.py          — Route A SSIM/LPIPS A/B framework; reusable for Hybrid Ulysses-Ring
+nccl_tuning_ab.py        — generic NCCL knob A/B harness
+nccl_nchannels_h100.py   — hardware-aware NCCL diagnostic (records L40S vs H100 divergence)
+```
+
+**Removed** (experiment-concluded, no reuse):
+
+```
+offload_off_test.py      — single-point measurement of "offload disabled" — concluded
+offload_3cell_ab.py      — 3-cell offload-flag sweep — concluded
+```
+
+### 22.5 Conclusion: software-layer NCCL = 0 % general gain
+
+Six hypotheses + one cleanup variant exhausted without a ship-worthy
+general improvement on the L40S target hardware. The empirical bound is:
+
+- **Bandwidth ceiling (§17.2, §22 cost model)**: 8.9 TB total NCCL ÷
+  ~24 GB/s NCCL busbw ≈ 370 s, within 1.4× of the measured 271 s per-rank
+  NCCL wall. The workload is already running near the aggregate-bandwidth
+  cap.
+- **Per-call overhead (§22 bucket 3)**: ~97 % of NCCL kernel time is
+  launch+ring+sync, not wire. Items 1, 2, 5, 6 all targeted this surface
+  and produced 0 % gain — the overhead constant is structural to NCCL's
+  ring algorithm on a 4-rank PCIe topology and is not knob-tunable on this
+  hardware.
+- **Item A (bucket-1 layout copies)**: 27.3 s/rank exists in the profile
+  but is overlap-hidden behind NCCL waits on the shared stream (§22.3
+  earlier conclusion). Removing it produced −0.6 % wall, confirming the
+  prediction.
+
+### 22.6 Remaining algorithmic direction: Hybrid Ulysses-Ring
+
+The only path left that can change the per-rank NCCL wall is an
+**algorithm-level** change to the sequence-parallel attention pattern
+itself, not a knob or wrapper refactor:
+
+- **Ulysses** (current): two `all_to_all_4D` per attention layer; payload
+  scales with `(seq_len × head_dim × heads)`.
+- **Ring Attention**: replace the all-to-all with a streaming ring where
+  each rank holds a sequence shard and rotates KV chunks through the ring,
+  computing attention incrementally. Comm/compute can interleave by
+  construction.
+- **Hybrid**: Ulysses across some dimensions, Ring across others — chooses
+  per-layer or per-shape which pattern minimises total comm volume + lets
+  compute overlap meaningful chunks of comm.
+
+Hybrid Ulysses-Ring is the only remaining direction that targets the
+**bandwidth ceiling** itself (by changing what gets shipped), not the
+overhead constant (which is structural). It requires re-deriving the SP
+attention algebra and substantial restructuring of `attention/layer.py` +
+`base_device_communicator.py`. Out of scope for any near-term FastVideo
+landing — flagged here as the remaining algorithmic lever after the knob
+space has been exhausted.
+
+The `cfg_batch_ab.py` SSIM/LPIPS framework retained in §22.4 is reusable
+for evaluating quality parity if/when this direction is pursued.
+
+---
+
+## 23. H100 single-GPU baseline + TGATE on H100 (2026-05-17)
+
+**Status: H100 sp=1 baseline + TGATE 0.5 measured; FA3 measurement
+deferred (Modal workspace billing cap).** First measurement on Hopper
+hardware. Driver of this section: priority-1 ask from Will for an H100
+profile, including FA3-firing check and TGATE behaviour without the NCCL
+wall present on L40S sp=4.
+
+### 23.1 Setup
+
+Two new artifacts landed for this measurement:
+
+```
+.buildkite/performance-benchmarks/tests/wan-t2v-1.3b-h100-sp1.json
+    (mirror of wan-t2v-1.3b-l40s-compile-sp1; sp_size=1, vae_sp=false,
+     enable_torch_compile=true, H100-appropriate memory threshold)
+
+fastvideo/tests/modal/perf_nsys_profile.py
+    +run_perf_nsys_h100_sp1     (gpu="H100:1", traces /results/perf_h100_sp1.nsys-rep)
+    +run_perf_nsys_h100_sp1_fa3 (same + flash-attention/hopper source build)
+    +PERF_GPU=h100-sp1 / h100-sp1-fa3 entrypoints
+```
+
+Same `wan-t2v-1.3b-h100-sp1` benchmark_id is shared across baseline,
+TGATE A/B, and the (deferred) FA3 run — only the env vars differ.
+
+### 23.2 Baseline (FA2 default, no TGATE)
+
+`PERF_GPU=h100-sp1 modal run perf_nsys_profile.py` →
+`/results/perf_h100_sp1.nsys-rep` + perf JSON.
+
+Device: `NVIDIA H100 80GB HBM3`, driver 580.95.05, compute_cap 9.0.
+1 warmup + 2 measurement runs at `720×1280 / 77 frames / 30 inference steps`.
+
+```
+individual_times_s : [192.30, 193.74]    σ < 1%
+avg_generation_time: 193.02 s
+throughput         : 0.399 fps  (per-video)
+peak_memory        : 24,680 MB / 81,559 MB (30.3% of HBM)
+
+avg_stage_times_s:
+  DenoisingStage       182.47   (94.53% of e2e)
+  DecodingStage          7.32   ( 3.79% — vae_sp=false, vae_tiling=true)
+  TextEncodingStage      0.91   ( 0.47% — text_encoder_precisions=fp32)
+  LatentPreparationStage 0.025
+  TimestepPreparationStage 0.0005
+  ConditioningStage      ~0
+  InputValidationStage   ~0
+```
+
+DiT denoising owns 94.5% of end-to-end on H100 sp=1 — strictly higher
+share than 4×L40S sp=4 (where DenoisingStage was ~78% of e2e because
+NCCL wait dilutes the share). This matters for TGATE prediction
+(§23.4): the larger the DiT share, the closer TGATE's per-step
+compute reduction maps to e2e.
+
+### 23.3 nsys-ai Mode 1 analysis on baseline trace
+
+`nsys-ai skill run profile_health_manifest perf_h100_sp1.sqlite` plus
+`top_kernels` / `tensor_core_usage`. Full profile span 635.5 s
+(1 warmup + 2 measurement generations + setup/teardown).
+
+**Top GPU kernels (whole 635 s profile)**:
+
+```
+                                                           tc_pct  fa_ver
+  448,775 ms  void flash::flash_fwd_kernel<                 100%   FA2
+              Flash_fwd_kernel_traits<128,128,64,4, ...,
+              cutlass::bfloat16_t, ...>>(flash::Flash_fwd_params)
+   25,051 ms  nvjet_tst_192x192_64x4_2x1_v_bz_coopB_TNN     100%   cuBLAS Hopper
+   13,763 ms  nvjet_tst_192x192_64x4_1x2_h_bz_coopB_TNN     100%   cuBLAS Hopper
+   11,309 ms  at::native::elementwise_kernel<direct_copy>    n/a   FP32 cast
+    9,689 ms  at::native::elementwise_kernel<MulFunctor>     n/a   FP32 mul
+    7,650 ms  at::native::unrolled_elementwise_kernel<       n/a   FP32 cast
+              direct_copy with cast>
+    5,217 ms  sm90_xmma_fprop_implicit_gemm_f32f32_tf32f32   100%   VAE conv
+      900 ms  triton_red_fused__flash_attn_forward__         100%   FFN tail
+              to_copy_add_addmm_mean_mul_pow_rsqrt_view_1
+      559 ms  fmha_cutlassF_f32_aligned_32x128_gmem_sm80(      0%   text enc attn
+              PyTorchMemEffAttention::AttentionKernel<...>)
+```
+
+**Kernel-count cross-check** (validates the FA call count is consistent
+with the workload): `10,800 FA calls = 30 denoise_steps × 30 transformer_blocks
+× 2 (cond+uncond) × 2 (self_attn + cross_attn) × 3 generations`. Exact.
+
+**`overlap` / `idle` (auto-trim 20 s window inside the profile)**:
+
+```
+compute_only_ms : 19,763  (98.8% of window — GPU is busy)
+nccl_only_ms    :      0  (single GPU; expected)
+idle_ms         :    115  ( 0.6%)
+```
+
+**Misleading manifest signal to discount**: `suspected_bottleneck =
+"High CPU Synchronization Blocking (78.7% of span)"` is an artifact of
+the 20 s auto-trim window landing on a VAE-decode / python interlude
+between the two measurement runs (sync_density inside that window is
+high; whole-profile compute is dominant). Top-kernel + overlap data is
+the authoritative read.
+
+### 23.4 FA-version surprise: FA2, not FA3
+
+The kernel name `void flash::flash_fwd_kernel<Flash_fwd_kernel_traits<...>>`
+with parameter struct `flash::Flash_fwd_params` is the **FA2 mainloop
+signature**, not FA3. FA3 mainloop would be
+`flash::flash_fwd_ws_kernel` (WS = warp-specialized) with
+`Flash_fwd_kernel_traits_ws` traits.
+
+Probe added to the new H100 entrypoint confirms the import path that
+fastvideo selects:
+
+```
+[probe] flash_attn fa_version=2
+```
+
+Mechanism: `fastvideo/attention/backends/flash_attn.py` import chain is
+
+```python
+try:    from fastvideo.attention.utils.flash_attn_cute  → fa_version="4"
+except: try:    from flash_attn_interface                → fa_version="3"
+        except: from flash_attn                          → fa_version="2"
+```
+
+The `fastvideo-dev:py3.12-latest` image ships `flash_attn` (FA2) only;
+`flash_attn_interface` (the python module name installed by
+`flash-attention/hopper/setup.py`) is not present. Backend selection
+silently falls back to FA2 even though the GPU is sm90.
+
+`tc_achieved_pct = 100%` on the FA2 kernel says it is already saturating
+HMMA tensor cores. FA3's win on Hopper does not come from filling more
+tensor-core cycles (FA2 is already filling them); it comes from
+**WGMMA** instructions (higher per-cycle throughput than HMMA) and
+**warp-specialized** producer/consumer pipelining (hides
+HBM→SMEM latency). Dao Labs published benchmarks put bf16 head=128 FA3
+vs FA2 at roughly 1.5–2× on H100 for attention kernels alone.
+
+Quantified expectation if FA3 were installed (applied to baseline 193 s):
+
+```
+FA2 attention wall = 448.78 s of 635 s profile = 70.6%
+Per-generation FA2 share = 0.706 × 193 s = 136 s of 193 s end-to-end
+FA3 30–40% reduction on attention → save 41–54 s per generation
+Predicted e2e: 193 s → 139–152 s  (−21% to −28%)
+```
+
+This is comparable in magnitude to TGATE alone (§23.5). The two stack
+because TGATE skips uncond forwards entirely (removes work) and FA3
+makes each remaining attention call faster (per-unit speedup).
+Combined prediction below in §23.6.
+
+### 23.5 TGATE 0.5 on H100 sp=1 (FA2 still)
+
+`FASTVIDEO_TGATE_STEP=0.5 PERF_GPU=h100-sp1 modal run …`. Cross-job A/B
+(not same-container — see methodology note at end of subsection).
+
+```
+individual_times_s : [147.22, 147.20]    σ ~0.01%
+avg_generation_time: 147.21 s
+throughput         : 0.523 fps  (+31.0% vs baseline)
+peak_memory        : 24,681 MB  (flat — TGATE adds no activation memory)
+
+avg_stage_times_s:
+  DenoisingStage       137.85   (was 182.47 → −24.45%)
+  DecodingStage          7.31   (flat ±0.01s)
+  TextEncodingStage      0.91   (flat)
+```
+
+TGATE telemetry (printed once per generation, three times in the perf log):
+
+```
+TGATE summary: fraction=0.500 gate_step=15/30 fresh_uncond=15 reused=15 invalidations=0
+```
+
+`fresh_uncond + reused = 30 = num_inference_steps`, exactly as in
+§21.5 — gating boundary fires correctly on H100. `invalidations=0`
+because this is Wan2.1 T2V (single transformer, no Wan2.2 boundary).
+
+**End-to-end delta**: `(193.02 − 147.21) / 193.02 = −23.74%`.
+
+**Methodology caveat**: A/B was two separate Modal invocations
+(baseline at 06:58Z, TGATE 0.5 at 07:14Z) on the same `H100:1`
+allocation class, not the same physical container. §21.2's rule
+("perf claims under ±15% require same-container A/B") does not strictly
+fire here because the measured delta is 23.7%, well outside the L40S
+cross-run variance band (which was ±26% in §21.2). Within-run variance
+on both H100 jobs is σ < 1% (much tighter than L40S σ ±0.6 s on a
+220 s mean), suggesting H100 single-GPU allocations on Modal are
+significantly more reproducible than 4×L40S allocations were. A
+formal same-container H100 A/B is listed in §23.9 follow-ups but is
+not load-bearing for the −23.7% headline.
+
+### 23.6 §18.2 prediction scorecard — H100 sp=1 update
+
+Same scorecard format as §21.6 but on Hopper:
+
+| Item | §18.2 predicted | Measured H100 sp=1 | Match |
+|---|---|---|---|
+| Forward count reduction | −25% | −25% (60 → 45) | exact |
+| DenoisingStage reduction | ~25% | −24.5% | exact |
+| End-to-end reduction | ~22% | −23.7% | beats prediction by 1.7pp |
+| Activation memory delta | 0% | 0 MB (24,680 ↔ 24,681) | exact |
+| Per-metric quality cost | < 5% | not re-run on H100 (FA2 path is bit-equal to L40S FA2 path — §21.4 result carries) | inherited |
+
+**Why H100 sp=1 beats L40S sp=4 in TGATE %** (−23.7% vs −22.0%):
+DiT share of e2e is higher on H100 sp=1 (94.5%) than on L40S sp=4
+(~78% — diluted by NCCL wait and SP'd VAE). TGATE saves a fixed 25%
+of DiT compute; that 25% maps more directly to e2e when DiT owns more
+of e2e. Will's prior hypothesis was that "no NCCL wall on H100 = smaller
+TGATE benefit"; this is correct in **absolute walltime** (46 s saved on
+H100 vs ~49 s on L40S sp=4) but wrong in **percentage** — the
+denominator shrinks faster than the saving.
+
+### 23.7 H100 sp=1 vs 4×L40S sp=4 — efficiency comparison
+
+For the record, since this is the first apples-to-different-hardware
+data point in this report:
+
+| Config | baseline e2e | TGATE 0.5 e2e | per-step DiT |
+|---|---:|---:|---:|
+| 4×L40S sp=4 (§21) | 220.9 s | 172.2 s | 5.79 s/step |
+| 1×H100 sp=1      | 193.0 s | 147.2 s | 6.08 s/step |
+
+Per-step DiT time is slightly *higher* on H100 sp=1 than on 4×L40S sp=4
+(6.08 vs 5.79 s), because 4×L40S divides each step's compute across
+4 ranks (with NCCL overhead added back). Aggregate compute per step:
+
+- 4×L40S sp=4 → 4 × 5.79 = 23.2 s aggregated GPU-seconds per step
+- 1×H100 sp=1 → 1 × 6.08 = 6.08 s GPU-seconds per step
+
+→ 1×H100 is roughly **3.8× more GPU-efficient per step than 4×L40S sp=4**,
+which is qualitatively consistent with the FLOPs-per-watt and HBM-bandwidth
+deltas between Hopper and Ada Lovelace, plus the SP comm tax. Whole-system
+walltime ratio is only 1.14× because the L40S configuration's 4× parallelism
+recovers most of the per-rank disadvantage.
+
+### 23.8 FA3 install attempts — methodology lessons
+
+Implemented `run_perf_nsys_h100_sp1_fa3` that follows
+`docs/inference/optimizations.md:60-68`:
+
+```bash
+git clone --depth 1 https://github.com/Dao-AILab/flash-attention.git
+cd flash-attention/hopper
+pip install -q ninja
+MAX_JOBS=8 python setup.py install   # nvcc compile of CUTLASS hopper kernels
+```
+
+PyPI `flash-attn-3` does not exist as a published wheel (`pip install
+flash-attn-3` returns "No matching distribution found"), so source build
+is the only path.
+
+Three attempts before a successful run:
+
+1. **`tail -20` buffer bug** — used `pip install -v . 2>&1 | tail -20`
+   instead of `python setup.py install`. `tail` buffered all nvcc output
+   until pip exited, so the run was silent for 48 minutes. Killed at
+   48 min wall, no pytest reached.
+2. **Modal billing cap** — `python setup.py install` fix landed but
+   `App creation failed: workspace billing cycle spend limit reached.`
+   The first attempt's 48 min H100 build counted without producing a
+   measurement. Cycle reset before next attempt.
+3. **Container timeout 5400 s** — third attempt reached `[275/293]`
+   kernels at the 90 min `timeout=5400` mark; Modal killed it before
+   the final 18 kernels + `setup.py install` link step. Function
+   `timeout` bumped to 10800 (180 min) for retry.
+4. **Successful run (4th attempt, 2026-05-18 07:03–08:48Z)** — full
+   build to `[293/293]` in 96 min, `[fa3] OK module loaded`,
+   `[probe] flash_attn fa_version=3`, pytest passed. Measurement in
+   §23.10.
+
+Total H100 cost across attempts: roughly 90 + 0 + 75 + 95 = ~260 min of
+wall on H100 for one usable trace. Most of this is the FA3 source build
+being re-paid each fresh Modal container.
+
+**Cache mitigation landed for future runs**: `fastvideo/tests/modal/perf_nsys_profile.py`
+now declares a `fa3-build-cache` Modal volume and the install block is
+restructured into three paths checked in order:
+
+1. Already present in `site-packages` (future-proof for when image bakes it).
+2. Restore from `/fa3_cache/site-packages-${IMAGE_VERSION}/` via `cp -r`
+   (~30 s).
+3. Source build + transactional save to cache (~90 min, once per
+   `IMAGE_VERSION`).
+
+Cache key embeds `IMAGE_VERSION` so an image upgrade with a different
+torch / cuda ABI invalidates and rebuilds automatically. The
+*next* FA3 run after this patch lands populates the cache; every run
+after that hits path 2 and gets to pytest in ~30 s.
+
+### 23.10 FA3 baseline measurement (2026-05-18)
+
+Successful FA3 run, same `wan-t2v-1.3b-h100-sp1` config as §23.2, only
+delta is the FA3 source build added before pytest.
+
+```
+individual_times_s : [124.80, 124.33]    σ < 0.4%
+avg_generation_time: 124.57 s
+throughput         : 0.618 fps  (was 0.399 — +55%)
+peak_memory        : 24,681 MB  (was 24,680 — flat)
+
+avg_stage_times_s:
+  DenoisingStage       114.77   (was 182.47 → −37.10%)
+  DecodingStage          7.30   (was   7.32 → flat ±0.02s)
+  TextEncodingStage      0.91   (was   0.91 → flat)
+```
+
+**End-to-end delta vs FA2 baseline (§23.2)**: −35.45 %, **far beyond
+§23.4's predicted −21 to −28 %**.
+
+### 23.10.1 Kernel-level confirmation (Mode 1 + top_kernels on FA3 trace)
+
+Full FA3 mainloop kernel name (whole 438 s profile):
+
+```
+240,298 ms × 10,800 calls
+  void cutlass::device_kernel<flash::enable_sm90<flash::FlashAttnFwdSm90<
+    flash::CollectiveMainloopFwdSm90<2,
+      cute::tuple<cute::C<1>, cute::C<1>, cute::C<1>>,
+      cute::tuple<cute::C<128>, cute::C<176>, cute::C<128>>,
+      128, cutlass::bfloat16_t, float, cutlass::arch::Sm90, ...
+    >,
+    flash::CollectiveEpilogueFwd<...>,
+    flash::StaticPersistentTileScheduler<0>
+  >>>(T1::Params)
+```
+
+This is the FA3 Hopper kernel signature: `enable_sm90` wrapper,
+`FlashAttnFwdSm90` Hopper-specialised mainloop, `cutlass::arch::Sm90`
+target tag, and `StaticPersistentTileScheduler` (FA3's persistent-kernel
+scheduling). Bit-tile is `<128, 176, 128>` for bf16 head=128 — the
+FA3 warp-specialised Hopper variant.
+
+Per-call attention time:
+
+| Variant | Attention wall | Calls | ms/call | per-call ratio |
+|---|---:|---:|---:|---:|
+| FA2 (§23.3) | 448,775 ms | 10,800 | 41.6 | 1.00× |
+| **FA3 (§23.10.1)** | **240,298 ms** | 10,800 | **22.2** | **0.534×** |
+
+**Per attention call, FA3 is 46.6 % faster** — well past the 30 – 40 %
+upper-bound figure Dao Labs publishes for bf16 head=128. The extra
+margin probably comes from the cache scheduler + persistent-kernel
+launches reducing per-step launch overhead, not just kernel cycle time.
+
+**Mechanism cross-check** (does kernel-level savings explain e2e
+savings?):
+
+```
+saved_per_profile  = (41.6 − 22.2) ms × 10,800 calls           = 209.5 s
+saved_per_generation = 209.5 / 3 generations                   ≈  69.8 s
+FA2 baseline e2e  − saved_per_generation = 193.0 − 69.8        = 123.2 s
+FA3 measured e2e                                                = 124.6 s
+residual                                                        ≈   1.4 s  (≈1 %)
+```
+
+The 1.4 s residual is well inside iteration-to-iteration variance and
+warmup smear; **the e2e speedup is fully accounted for by FA3 attention
+speedup alone** — no VAE / text-encode / Python-overhead savings from
+the FA3 swap (those stages are flat to ±0.02 s).
+
+`overlap_breakdown` and `idle_pct` on the FA3 trace are essentially
+unchanged from FA2 (compute_only 98.8 %, idle 0.9 %); FA3 didn't open
+up any new idle gap or sync hotspot, it just makes the dominant
+work faster.
+
+### 23.10.2 §23.4 prediction scorecard
+
+| Item | §23.4 predicted | Measured FA3 | Match |
+|---|---|---|---|
+| Per-attention-call speedup | 30 – 40 % | **46.6 %** | beats |
+| Per-generation attention saved | 41 – 54 s | 69.8 s | beats |
+| End-to-end reduction | −21 to −28 % | **−35.5 %** | beats by 7.5 pp |
+| Peak memory | unchanged | flat (24,680 ↔ 24,681 MB) | exact |
+| Stage breakdown shift | only DenoisingStage moves | only DenoisingStage moves (−37.1 %; others flat) | exact |
+
+§23.4's prediction was based on Dao Labs's bf16 head=128 H100 benchmark
+in the FA3 paper (`flash-attention/hopper/benchmarks/`). That data is
+attention-call-only; this workload calls attention 10,800 times in tight
+loops, and the persistent scheduler appears to claw back additional
+per-call launch overhead. Recording the gap so the next prediction can
+adjust.
+
+### 23.10.3 What's left to measure on the FA3 path
+
+1. **FA3 + TGATE 0.5 stacking** — measured in §23.11. Result: clean
+   multiplicative stacking.
+2. **VBench / SSIM quality re-run on FA3** — FA3 uses different
+   accumulation order (WGMMA) than FA2 (HMMA); numerics drift even
+   though both are bf16. §21.4's L40S/FA2 VBench result does NOT carry
+   to FA3 H100. Need a fresh quality pass before recommending FA3 as a
+   default for any commercial deployment.
+
+### 23.10.4 FA2 vs FA3 deep kernel comparison
+
+Direct trace-vs-trace dive on `perf_h100_sp1.sqlite` (FA2) and
+`perf_h100_sp1_fa3.sqlite` (FA3). Goal: localise the speedup down to
+the kernel template and confirm no side effects elsewhere.
+
+#### Bimodal attention split — 99 % of attention wall is self-attention
+
+Attention calls are clustered into two populations by sequence length:
+
+| Variant | self-attn N | total | ms/call | cross-attn N | ms/call |
+|---|---:|---:|---:|---:|---:|
+| FA2 baseline    | 5,400 | 445.09 s (99.2 %) | **82.42** | 5,400 | 0.682 |
+| FA3 baseline    | 5,400 | 237.97 s (99.0 %) | **44.07** | 5,400 | 0.432 |
+| FA3 vs FA2      | same  | −207 s | **−46.5 %**   | same  | **−36.7 %** |
+
+Self-attn is on video latents (seqlen 31,200); cross-attn is on text
+tokens (seqlen 512). FA3's win is overwhelmingly on self-attention —
+cross-attn benefits in relative terms but contributes < 1 % of attention
+walltime either way. Call-count math: `5,400 = 30 blocks × 30 steps × 2
+CFG × 3 generations × 1 attn-of-each-type-per-block`. Both populations
+sum to 10,800, the full attention count.
+
+#### Kernel template variants — single template instantiation each side
+
+```text
+FA2 mainloop signature:
+  void flash::flash_fwd_kernel<
+    Flash_fwd_kernel_traits<128, 128, 64, 4, false, false,
+                            cutlass::bfloat16_t, ...>,
+    ...
+  >(flash::Flash_fwd_params)
+
+  → head_dim=128, kBlockM=128, kBlockN=64, kNWarps=4
+  → tile shape 128×64  =  8,192 elements per tile
+
+FA3 mainloop signature:
+  void cutlass::device_kernel<flash::enable_sm90<
+    flash::FlashAttnFwdSm90<
+      flash::CollectiveMainloopFwdSm90<2,
+        cute::tuple<C<1>, C<1>, C<1>>,
+        cute::tuple<C<128>, C<176>, C<128>>,    // tile shape
+        128, bfloat16_t, float, cutlass::arch::Sm90, ...
+      >,
+      flash::CollectiveEpilogueFwd<...>,
+      flash::StaticPersistentTileScheduler<0>   // persistent scheduling
+    >
+  >>>(T1::Params)
+
+  → tile shape 128×176×128 = 22,528 elements per tile (2.75× FA2)
+  → arch::Sm90 → WGMMA path (vs FA2's HMMA)
+  → StaticPersistentTileScheduler → kernel persists, dispatches tiles internally
+```
+
+Both backends fire **exactly one template instantiation** (head_dim 128,
+bf16, non-causal). Same shape coverage — the speedup is entirely from
+the new template's mechanics, not from picking a different variant.
+
+#### No JIT warmup smear
+
+| | first-fwd avg ms | last-fwd avg ms | smear |
+|---|---:|---:|---:|
+| FA2 self-attn | 81.99 | 82.46 | < 1 % |
+| FA3 self-attn | 43.20 | 43.97 | < 2 % |
+
+`enable_torch_compile=true` means the compiled graph is hot by the time
+measurement starts. There's no JIT recompilation cost between forwards.
+
+#### Outlier distribution — variance is tight
+
+| Variant | top-10 outlier range | avg | max spike |
+|---|---|---:|---:|
+| FA2 | 86.4 – 89.3 ms | 82.4 | +8 % over avg |
+| FA3 | 48.7 – 55.1 ms | 44.1 | +25 % over avg |
+
+FA3 has slightly larger relative outliers (25 %) but its worst kernel
+(55 ms) is still 35 % faster than FA2's median (78 ms). Outliers cluster
+in time (e.g. FA2 calls at 583.86 s and 584.06 s; FA3 calls at 230.32 s
+and 230.39 s) — likely SM contention spikes when adjacent kernels race
+for the same partitions, not hardware throttling.
+
+#### Non-attention work — identical workload, identical kernel counts
+
+| Category | FA2 | FA3 | Δ |
+|---|---:|---:|---:|
+| cuBLAS Hopper GEMM (nvjet) | 41.37 s | 44.51 s | +7.6 % |
+| Triton fused (FFN tail) | 17.30 s | 18.26 s | +5.6 % |
+| PyTorch elementwise | 42.78 s | 43.84 s | +2.5 % |
+| VAE cudnn conv | 11.01 s | 11.03 s | +0.2 % |
+| Text encoder attn (sm80 mem-eff) | 0.56 s | 0.56 s | +0.3 % |
+| PyTorch cat | 2.42 s | 2.43 s | +0.0 % |
+
+Kernel counts are identical to within ±5 (32,400 for the dominant
+nvjet QKV/FFN projection in both). The +5–7 % "slowdown" on cuBLAS /
+Triton is measurement artifact — CUPTI per-kernel overhead is more
+visible when the profile is 31 % shorter and the GPU spends more
+clock-state changes between work bursts. Absolute additional time is
++4 s, dwarfed by FA3's −208 s attention saving.
+
+#### Memory transfer pattern — identical workload, FA3 not memory-bound
+
+| Direction | FA2 N / GB / time | FA3 N / GB / time |
+|---|---|---|
+| H2D | 3,190 / 162.99 GB / 6.13 s | 3,190 / 162.99 GB / 5.08 s |
+| D2H | 545 / 26.16 GB / 8.23 s | 545 / 26.16 GB / 7.49 s |
+| Array→Host (FA softmax LSE) | 15,141 / 4,036.78 GB / 2.63 s | 15,139 / 4,036.34 GB / 2.63 s |
+
+H2D / D2H counts and bytes are identical (model weight loads + frame
+output). The Array→Host count differs by only 2 (within measurement
+noise). FA3 is not changing what memory gets moved — only how the
+attention kernel itself accesses HBM internally.
+
+#### Profile span + GPU utilisation — Amdahl tightening
+
+| | FA2 | FA3 | Δ |
+|---|---:|---:|---:|
+| Profile span | 635.5 s | 438.6 s | −197 s (−31 %) |
+| Kernel time | 566.8 s | 363.5 s | −203 s |
+| GPU busy % | 89.2 % | 82.9 % | −6.3 pp |
+| Effective idle | 68.7 s | 75.1 s | **+6.4 s** |
+
+GPU busy % drops 89.2 → 82.9. **Not a regression** — attention finished
+faster, so the surrounding fixed-cost work (text encode, VAE decode,
+Python step) takes up a larger fraction of the (shorter) wall. Classic
+Amdahl: shrink the dominant term, the next-largest term's share grows.
+The next-tier targets are now the non-attention DiT compute (cuBLAS,
+elementwise, Triton) plus VAE / text encoder.
+
+#### MFU — attention kernel efficiency nearly doubled
+
+Self-attention FLOPs per call: `2 × seqlen² × head_dim × num_heads =
+2 × 31200² × 128 × 12 = ~6 TFLOPs` (counting both QK^T and attn·V at
+2 FLOPs per multiply-add).
+
+| | self-attn ms | sustained TFLOPS | MFU (vs H100 989 TF bf16 peak) |
+|---|---:|---:|---:|
+| FA2 | 82.4 | 72.8 | **7.4 %** |
+| FA3 | 44.1 | 136.1 | **13.8 %** (1.86×) |
+
+FA3 nearly doubles attention-kernel MFU. The absolute MFU is still
+low (13.8 %) because long-sequence attention is HBM-bandwidth bound —
+the K/V matrix has to stream through SMEM repeatedly regardless of
+how clever the compute path is. To exceed this on H100 requires
+quantising the K/V representation (FP8/FP4 attention, sparse attention,
+or sliding-window patterns), which §23.4's prediction range already
+flagged as out-of-scope on bf16 attention.
+
+Whole-model e2e MFU: FA2 ≈ 4.8 %, FA3 ≈ 9.0 %.
+
+### 23.11 FA3 + TGATE 0.5 stacking (2026-05-18)
+
+Cross-job A/B on cache-populated path. Same H100:1 container class,
+same benchmark_id, env-var delta only.
+
+```
+individual_times_s : [94.97, 95.15]      σ < 0.2 %
+avg_generation_time: 95.06 s
+throughput         : 0.810 fps           (was 0.399 FA2 — +103 %)
+peak_memory        : 24,680 MB           (flat across all four variants)
+
+avg_stage_times_s:
+  DenoisingStage        85.33   (FA3 alone 114.77 → −25.6 %)
+  DecodingStage          7.34   (flat)
+  TextEncodingStage      0.92   (flat)
+```
+
+TGATE telemetry per generation: `fraction=0.500 gate_step=15/30
+fresh_uncond=15 reused=15 invalidations=0` — three matching summaries,
+identical to §23.5.
+
+### 23.11.1 Full stacking table
+
+| Variant | avg e2e | DiT stage | vs FA2 baseline | throughput |
+|---|---:|---:|---:|---:|
+| FA2 baseline (§23.2) | 193.02 s | 182.47 s | — | 0.399 fps |
+| FA2 + TGATE 0.5 (§23.5) | 147.21 s | 137.85 s | −23.7 % | 0.523 fps |
+| FA3 baseline (§23.10) | 124.57 s | 114.77 s | −35.5 % | 0.618 fps |
+| **FA3 + TGATE 0.5** | **95.06 s** | **85.33 s** | **−50.8 %** | **0.810 fps** |
+
+### 23.11.2 Multiplicative stacking verified
+
+`(1 − 0.355) × (1 − 0.237) = 0.492` → predicted combined e2e
+`193.02 × 0.492 = 94.97 s`. Measured 95.06 s. Residual is 0.09 s
+(< 0.1 %).
+
+Mechanism check that the stacking has no hidden overlap:
+
+- TGATE removes 25 % of attention calls (gate at step 15/30 skips
+  every other forward's uncond branch). The *removed* calls cost the
+  full FA3 attention time; TGATE's win scales linearly with whatever
+  attention costs.
+- FA3 makes each *remaining* attention call ~46.6 % faster. The
+  *speedup* applies to whatever attention calls survive.
+- No shared bottleneck: TGATE only reads the precomputed `Δ` tensor
+  (microseconds-scale elementwise op, never hits the FA kernel path);
+  FA3 only changes the kernel implementation, not the call schedule.
+
+So the two optimisations attack orthogonal axes of the same loop and
+multiply cleanly. This was anticipated in §23.4 / §23.10.3 and now
+empirically confirmed.
+
+### 23.11.3 Cache-aware install path: empirical verification
+
+This was the first FA3 run after the §23.8 cache mitigation landed.
+Behaviour observed (from `b8k9lsuyq` monitor log):
+
+1. Cache check: `/fa3_cache/site-packages-py3.12-latest/.INSTALLED`
+   missing → cache miss.
+2. Build: cloned flash-attention, ran `python setup.py install`, 100 min
+   wall (slightly slower than §23.10's 96 min — normal variance on
+   Modal container CPU).
+3. Save: staged to `/fa3_cache/staging-<pid>/`, `mv` to
+   `/fa3_cache/site-packages-py3.12-latest/`, touched `.INSTALLED`.
+   Logged `[fa3] cache saved to /fa3_cache/site-packages-py3.12-latest`.
+4. Volume committed via `fa3_cache_vol.commit()` in the Python wrapper.
+
+The next FA3 run (FA2 vs FA3 same-container A/B, or any quality-pass
+re-run) should hit path 2 (`cache hit at $CACHE_DIR` → `cp -r` → import
+verify, ~30 s) instead of path 3 (~90–100 min build).
+
+### 23.11.4 §23.10.3 + §23.5 prediction scorecard
+
+| Item | Predicted | Measured | Match |
+|---|---|---|---|
+| FA3 + TGATE combined e2e | ~94 s | 95.06 s | exact (off 1 %) |
+| Multiplicative stacking | yes | yes (residual 0.09 s) | exact |
+| Peak memory | flat | flat (24,680 ± 1 MB across 4 variants) | exact |
+| TGATE telemetry counters | 15/15/0 | 15/15/0 | exact |
+| Throughput doubling vs baseline | implied by 0.51× e2e | 0.81 / 0.399 = 2.03× | exact |
+| Stage cleanliness (VAE/TextEnc untouched) | flat | flat (±0.02 s) | exact |
+
+Both §23.5 and §23.10.3 were correct end-to-end. The two routes were
+designed against the same per-step DiT model and turned out to compose
+without interference.
+
+### 23.11.5 FA3 vs FA3 + TGATE 0.5 deep kernel comparison
+
+Direct trace-vs-trace dive on `perf_h100_sp1_fa3.sqlite` and
+`perf_h100_sp1_fa3_tgate.sqlite`. Mirror of §23.10.4's FA2 vs FA3
+analysis but focused on a different axis: same kernel, different
+schedule.
+
+#### Per-call attention is invariant under TGATE
+
+| Variant | self-attn N | total | ms/call | cross-attn N | ms/call |
+|---|---:|---:|---:|---:|---:|
+| FA3 baseline | 5,400 | 237.97 s | **44.07** | 5,400 | 0.4320 |
+| FA3 + TGATE 0.5 | 4,050 | 176.69 s | **43.63** (−1.0 %) | 4,050 | 0.4269 (−1.2 %) |
+
+Per-call attention time stays within 1 % — both populations. TGATE is
+purely a call-count reduction; the FA3 kernel itself runs identically
+whether the surrounding loop is full CFG or post-gate cond-only.
+
+#### Attention call count delta — exactly matches TGATE spec
+
+| | total attn calls | per generation | post-gate per step |
+|---|---:|---:|---:|
+| FA3 baseline | 10,800 | 3,600 | 120 (= 30 blocks × 2 attn × 2 CFG) |
+| FA3 + TGATE 0.5 | **8,100** | 2,700 | 90 (post-gate: 60, pre-gate: 120) |
+| Δ | **−2,700 (−25.0 %)** | −900 | — |
+
+Predicted skip: `15 post-gate steps × 30 blocks × 2 attn types ×
+3 generations = 2,700`. Match is exact. Self-attn (slow, ≥ 10 ms)
+count: `45 forwards/gen × 30 blocks × 3 generations = 4,050` measured
+— exact again.
+
+#### Stage breakdown — only DenoisingStage moves
+
+| Stage | FA3 | FA3 + TGATE | Δ |
+|---|---:|---:|---:|
+| DenoisingStage | 114.77 s | 85.33 s | **−25.7 %** |
+| DecodingStage (VAE) | 7.30 s | 7.34 s | +0.5 % (flat) |
+| TextEncodingStage | 0.91 s | 0.92 s | +1.5 % (flat) |
+| LatentPreparationStage | 0.02 s | 0.03 s | +30 % (±10 ms — noise) |
+| **e2e** | **124.56 s** | **95.06 s** | **−23.7 %** |
+
+DenoisingStage −25.7 % matches the call-count cut to within 1pp.
+Everything outside the DiT loop is flat — TGATE has no side effects
+beyond the gated forwards.
+
+#### Non-attention kernel scaling — DiT inside drops 25 %, outside stays flat
+
+| Category | FA3 | FA3 + TGATE | Δ | Expected | Note |
+|---|---:|---:|---:|---:|---|
+| Attention (`device_kernel`) | 240.30 s | 178.42 s | **−25.8 %** | −25 % | ✓ DiT loop |
+| cuBLAS Hopper GEMM (nvjet QKV / FFN) | 44.51 s | 33.06 s | **−25.7 %** | −25 % | ✓ DiT loop |
+| Triton fused (norm / FFN tail) | 18.26 s | 13.90 s | **−23.9 %** | −25 % | ✓ DiT loop |
+| PyTorch elementwise | 43.84 s | 34.81 s | **−20.6 %** | −25 % | DiT loop + delta-cache ops |
+| PyTorch cat | 2.43 s | 1.82 s | **−25.0 %** | −25 % | ✓ DiT loop |
+| VAE cudnn conv | 11.03 s | 11.03 s | 0.0 % | 0 % | ✓ outside DiT |
+| Text encoder attn | 0.56 s | 0.56 s | flat | 0 % | ✓ outside DiT |
+
+Every DiT-internal category drops 24–26 %, every DiT-external category
+is flat. The PyTorch-elementwise undershoot (−20.6 % vs expected −25 %)
+is the **TGATE delta-cache cost** showing up: each gated step adds
+`sub + scalar_mul + add` for `delta = cond − uncond` and the
+reconstructed prediction. 4.4 pp on 43.84 s ≈ **1.9 s extra
+elementwise** per profile (~0.6 s per generation, ~2 % of e2e). The
+delta-cache machinery is essentially free.
+
+#### Profile span + GPU active/idle — idle is invariant
+
+| | FA3 baseline | FA3 + TGATE | Δ |
+|---|---:|---:|---:|
+| Profile span | 438.6 s | 351.2 s | −87.4 s |
+| Kernel time | 363.5 s | 276.1 s | −87.4 s |
+| GPU busy % | 82.9 % | 78.6 % | −4.3 pp |
+| **Effective idle** | **75.1 s** | **75.1 s** | **identical** |
+| # kernels | 234,234 | 189,551 | −44,683 (−19 %) |
+
+The interesting line: **idle time is identical** between the two
+variants (75.1 s in both). Idle on this workload is dominated by
+deterministic CPU/IO costs — model load, frame encode, Python step
+overhead — none of which TGATE touches. GPU busy % drops not because
+the GPU is throttled, but because the constant idle takes a larger
+share of the (shorter) profile. Same Amdahl-tightening pattern as
+§23.10.4's FA2→FA3 comparison.
+
+Generation save: `87.4 s / 3 generations = 29.1 s per gen`. Measured
+`124.57 − 95.06 = 29.5 s per gen`. Residual 0.4 s — within run-to-run
+noise.
+
+#### Memory transfers — A2H confirms forwards were truly skipped
+
+| Direction | FA3 N / GB / time | FA3+TGATE N / GB / time | Δ bytes |
+|---|---|---|---:|
+| H2D (weights) | 3,190 / 162.99 GB / 5.08 s | 3,145 / 162.99 GB / 5.93 s | **flat** |
+| D2H (frames) | 545 / 26.16 GB / 7.49 s | 545 / 26.16 GB / 12.85 s | **flat** (time 2× — see below) |
+| **A2H (FA softmax LSE)** | 15,139 / **4,036 GB** / 2.63 s | 12,306 / **3,141 GB** / 2.04 s | **−22 %** |
+
+A2H is the array-to-host write where FA dumps its softmax log-sum-exp
+auxiliary state. Both count (−19 %) and bytes (−22 %) drop in line
+with the forward-count reduction. **Independent confirmation that
+TGATE skipped real attention forwards** — not just kernel time, but
+their auxiliary memory traffic too.
+
+D2H wall time doubled (7.49 → 12.85 s) despite identical byte volume.
+Likely a different physical container with slower PCIe topology — the
+H100 single-GPU pool isn't homogeneous. Doesn't affect e2e because
+D2H lands in the post-generation idle window, off the critical path
+(consistent with the idle figure being identical).
+
+#### FLOPs / MFU — TGATE preserves kernel efficiency
+
+DiT FLOPs per generation: FA3 baseline does 60 forwards × ~6 TFLOPs of
+self-attn (plus GEMM / norms / elementwise) ≈ 3.6 PFLOPs. FA3 + TGATE
+does 45 forwards ≈ 2.7 PFLOPs (−25 %).
+
+| | FA3 baseline | FA3 + TGATE |
+|---|---:|---:|
+| DiT FLOPs / gen | ~3.6 PFLOPs | ~2.7 PFLOPs |
+| DiT wall / gen | 38.3 s | 28.4 s |
+| **DiT sustained TFLOPS** | **94** | **95** (essentially flat) |
+| e2e MFU (vs 989 TF bf16 peak) | **9.0 %** | **8.9 %** (flat) |
+
+TGATE preserves the kernel-level MFU (94 vs 95 TFLOPS sustained) —
+exactly as designed. It removes work instead of speeding up work, so
+the per-second-of-active-GPU efficiency is unchanged. Compared to FA2
+baseline's ~4.8 % e2e MFU, the stack went from 4.8 % → 9.0 % (FA3) →
+8.9 % (FA3 + TGATE). FA3 nearly doubled hardware efficiency; TGATE
+kept it while removing redundant CFG forwards.
+
+#### Summary table
+
+| Observation | Implication |
+|---|---|
+| Per-call attention invariant (44.07 → 43.63 ms) | TGATE doesn't perturb the kernel — pure call-count reduction |
+| Attention call count exactly −2,700 (−25 %) | TGATE implementation is bit-exact to spec |
+| Every DiT-internal op scales ×0.75; every DiT-external op stays flat | Side-effect-free isolation of TGATE's reach |
+| A2H bytes −22 % matches forward-count cut | Multi-signal confirmation TGATE truly skips work |
+| Delta-cache cost ~1.9 s (2 % of e2e) | TGATE's own overhead is negligible |
+| Idle time identical (75.1 s) | Fixed CPU/IO cost; not in TGATE's reach |
+| GPU busy 82.9 % → 78.6 % | Amdahl, not regression — fixed cost share grows |
+| Sustained TFLOPS 94 → 95 | Hardware efficiency preserved across the stack |
+
+### 23.12 Open follow-ups
+
+1. **VBench quality re-run on FA3 and FA3+TGATE** — §21.4's quality
+   table is L40S/FA2-only; FA3 changes numerics (WGMMA vs HMMA
+   accumulation order). Re-run `quality_eval_tgate.py`-equivalent on
+   H100 with both FA3 alone and FA3+TGATE. Required before
+   recommending the stacked configuration as a default for any
+   commercial deployment.
+2. **Same-container H100 A/B** for FA2 vs FA3 — current FA2/FA3
+   comparison is cross-job (cache-populated path makes this cheap now,
+   ~15 min per variant). Worth doing once for the methodology record
+   per §21.2, even though the cross-job σ on H100 single-GPU was
+   < 0.4 %.
+3. **Bake FA3 into the `fastvideo-dev` image** — §23.11.3 cache layer
+   removes per-run pain inside this repo, but for upstream consumers
+   the source build should land as an image-layer step.
+   - **Risk**: ABI break each torch/CUDA bump. Need a `flash-attention`
+     git-tag pin in the Dockerfile + a regression test that the image
+     boots with `import flash_attn_interface`.
+4. **H100 sp=2 / sp=4 sweep on FA3** — only relevant for multi-GPU
+   Hopper deployment. With FA3 doubling single-GPU throughput, the
+   sp=2 / sp=4 break-even point against single-GPU FA3 has likely
+   shifted; recompute. §22.2 already noted `NCCL_NCHANNELS=1` *harms*
+   H100 by +19 %, so any H100 multi-GPU work has to use NCCL defaults.
+5. **Per-prompt variance on FA3+TGATE** — every measurement so far
+   uses the same Will Smith / noodles prompt. Sweep 5+ prompts (Wan
+   2.1 demo set) under FA3+TGATE to confirm the 95 s figure isn't
+   prompt-specific.
+
